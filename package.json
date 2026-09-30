@@ -1,0 +1,35 @@
+{
+  "name": "marginfi-lst-kamino-flash-bot",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Atomic Kamino WSOL flash-loan → marginfi LST redemption bot",
+  "type": "module",
+  "scripts": {
+    "plan": "tsx src/cli.ts plan",
+    "simulate": "tsx src/cli.ts simulate",
+    "execute": "tsx src/cli.ts execute",
+    "watch": "tsx src/cli.ts watch",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "format:check": "prettier --check ."
+  },
+  "engines": {
+    "node": ">=20.18.0"
+  },
+  "dependencies": {
+    "@kamino-finance/klend-sdk": "5.1.11",
+    "@solana/spl-stake-pool": "1.1.8",
+    "@solana/web3.js": "1.98.4",
+    "bn.js": "5.2.1",
+    "decimal.js": "10.5.0",
+    "dotenv": "16.4.7"
+  },
+  "devDependencies": {
+    "@types/bn.js": "5.1.6",
+    "@types/node": "22.10.10",
+    "prettier": "3.4.2",
+    "tsx": "4.19.2",
+    "typescript": "5.7.3",
+    "vitest": "2.1.8"
+  }
+}
