@@ -39,7 +39,13 @@ Lengkapi minimal berikut di `.env`:
 - `RPC_URL`: RPC mainnet yang andal (untuk production gunakan RPC privat/staked).
 - `KEYPAIR_PATH`: path ke keypair JSON Solana CLI pada wallet hot.
 - `KAMINO_LENDING_MARKET`: market Kamino yang benar-benar berisi reserve WSOL. Nilai ini **sengaja tidak diberi default** agar tidak salah market.
-- Sebaiknya pin `KAMINO_WSOL_RESERVE` juga setelah diverifikasi di UI/SDK Kamino.
+- `KAMINO_WSOL_RESERVE` bersifat opsional. Jika tidak diisi, bot mencari reserve dengan mint WSOL di dalam market tersebut. Setelah market benar, cari dan pin alamat reserve dengan command berikut—command ini tidak membutuhkan `KEYPAIR_PATH` atau private key:
+
+  ```bash
+  npm run inspect:reserve
+  ```
+
+  Salin output `KAMINO_WSOL_RESERVE=...` ke `.env` untuk mengunci strategi ke reserve yang telah diverifikasi.
 
 Alamat default mrgnFi LST dan stake pool boleh dibiarkan. Jangan menganggap nilai default amount masih profitable hari ini—nilai tersebut adalah flow yang diminta, sedangkan quote, fee, NAV, dan reserve dibaca ulang setiap run.
 
