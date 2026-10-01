@@ -7,6 +7,7 @@ import {
 } from "./bot.js";
 import { formatAtomic } from "./amount.js";
 import { loadConfig, SOL_DECIMALS } from "./config.js";
+import { appendPairObservationLogs } from "./pair-observation-log.js";
 import {
   isPairObservation,
   rankPairObservations,
@@ -37,7 +38,7 @@ Kamino flash-arbitrage scanners
 Commands:
   npm run scan                    Quote every LST redemption whitelist entry; never builds, signs, or sends
   npm run scan:pairs              Observe DEX-to-DEX WSOL cycles; quotes only, never builds/signs/sends
-  npm run watch:pairs             Re-scan pair observations at POLL_MS; quotes only, never builds/signs/sends
+  npm run watch:pairs             Re-scan pair observations at PAIR_POLL_MS; quotes only, never builds/signs/sends
   npm run plan                    Build only the highest-ranked dynamic candidate; never sends
   npm run simulate                Build + simulate the highest-ranked dynamic candidate; never sends
   npm run execute -- --yes        Scan, simulate, then send the top candidate (requires EXECUTION_ENABLED=true)
@@ -191,6 +192,29 @@ function printPairObservationSummary(scan: PairScanResult): void {
   }
 }
 
+async function printAndLogPairObservation(args: {
+  scan: PairScanResult;
+  config: ReturnType<typeof loadConfig>;
+}): Promise<void> {
+  printPairObservationSummary(args.scan);
+  try {
+    const paths = await appendPairObservationLogs({
+      directory: args.config.pairObservationLogDir,
+      scan: args.scan,
+      config: args.config,
+    });
+    console.log(
+      `Saved pair-observation logs: ${paths.jsonlPath} | ${paths.csvPath}`,
+    );
+  } catch (error) {
+    // A local analytics write must never turn an otherwise safe observation into
+    // a failed process or interrupt the watcher.
+    console.warn(
+      `Could not save pair-observation logs: ${(error as Error).message}`,
+    );
+  }
+}
+
 function printPlanSummary(summary: ReturnType<typeof planSummary>): void {
   console.table(summary);
 }
@@ -213,7 +237,7 @@ async function runPairObservationOnce(): Promise<void> {
     config: runtime.config,
     strategies: runtime.strategies,
   });
-  printPairObservationSummary(result);
+  await printAndLogPairObservation({ scan: result, config: runtime.config });
 }
 
 async function watchPairObservations(): Promise<void> {
@@ -228,7 +252,10 @@ async function watchPairObservations(): Promise<void> {
         config: runtime.config,
         strategies: runtime.strategies,
       });
-      printPairObservationSummary(result);
+      await printAndLogPairObservation({
+        scan: result,
+        config: runtime.config,
+      });
     } catch (error) {
       console.log(
         `Pair observation failed: ${(error as Error).message.split("\n")[0]}`,

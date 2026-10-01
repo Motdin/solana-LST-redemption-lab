@@ -14,7 +14,7 @@ Kamino flash borrow WSOL
 Project ini memiliki dua scanner terpisah:
 
 1. **LST redemption** — alur di atas untuk whitelist LST / SPL stake pool di `strategies.json`; dapat dibangun, disimulasikan, dan—hanya dengan gate eksplisit—dikirim.
-2. **Pair observer** — observasi quote siklus dua venue untuk `WSOL → USDC/USDT → WSOL` dari `pair-strategies.json`:
+2. **Pair observer** — observasi quote siklus dua venue untuk `WSOL → stablecoin → WSOL` dari `pair-strategies.json`:
 
 ```text
 Kamino reference: WSOL flash principal + fee
@@ -34,7 +34,7 @@ Pair observer **hanya mengambil quote dan membaca state Kamino**. Ia tidak memua
 2. **Whitelist multi-pool** — tambahkan LST / SPL stake pool terverifikasi ke `strategies.json`.
 3. **Simulasi kandidat terbaik** — hanya kandidat dengan `net >= MIN_NET_PROFIT_SOL` yang dibangun dan disimulasikan.
 4. **Execution bergated** — send hanya ketika kandidat terbaik LST lulus scanner, build, simulation, `EXECUTION_ENABLED=true`, dan flag `--yes`.
-5. **DEX pair observer** — scan read-only `WSOL → USDC/USDT → WSOL` pada dua venue Jupiter yang disjoint. Tidak ada command execution untuk strategy ini.
+5. **DEX pair observer** — scan read-only `WSOL → stablecoin → WSOL` pada dua venue Jupiter yang disjoint. Tidak ada command execution untuk strategy ini.
 
 Tidak ada `MIN_LST_OUT`, `LST_TO_BURN`, atau `MIN_WITHDRAW_SOL` statis. Scanner LST memakai **Jupiter `otherAmountThreshold`** sebagai jumlah LST yang dibakar, lalu menghitung kembali NAV/withdraw fee stake pool. Pair observer memakai threshold leg pertama sebagai input leg kedua dan hanya menilai threshold WSOL akhir. Keduanya memakai gate dinamis:
 
@@ -87,6 +87,8 @@ Pair observer memakai file default `./pair-strategies.json`; ubah hanya jika And
 
 ```env
 PAIR_STRATEGIES_FILE=./pair-strategies.json
+PAIR_POLL_MS=300000
+PAIR_OBSERVATION_LOG_DIR=./logs/pair-observations
 ```
 
 `scan:pairs` dan `watch:pairs` hanya membutuhkan `RPC_URL`, market/reserve Kamino, serta konfigurasi Jupiter. Keduanya tidak membaca `KEYPAIR_PATH`; variabel tersebut tetap diperlukan untuk command LST `scan`, `plan`, `simulate`, `execute`, dan `watch`.
@@ -129,7 +131,7 @@ Scanner membatasi maksimal 24 strategi dan 64 quote per putaran untuk menghindar
 
 ## Observasi pair DEX (tanpa transaksi)
 
-`pair-strategies.json` terpisah dari whitelist LST. Default memantau dua arah untuk `WSOL/USDC` dan `WSOL/USDT` di Meteora DLMM dan Raydium CLMM. Kedua leg dipaksa memakai venue yang **disjoint**; entry yang memasang label DEX sama di kedua sisi akan ditolak saat file dibaca.
+`pair-strategies.json` terpisah dari whitelist LST. Default yang **aktif** memantau enam arah `WSOL/USDC` di Meteora DLMM, Raydium CLMM, dan Orca Whirlpool: setiap pasangan venue diamati pada kedua arah. Dua entry `WSOL/USDT` tetap tersedia tetapi dinonaktifkan karena observasi awal menunjukkan price impact yang jauh lebih buruk. Kedua leg dipaksa memakai venue yang **disjoint**; entry yang memasang label DEX sama di kedua sisi akan ditolak saat file dibaca.
 
 Untuk setiap nominal, observer mengambil quote ExactIn berikut secara serial:
 
@@ -146,7 +148,16 @@ flash principal + Kamino fee aktual + MAX_TX_COST_SOL + MIN_NET_PROFIT_SOL
 
 Kelebihan output aktual leg pertama di atas minimum tidak dihitung sebagai profit; ini menjaga hasil observasi konservatif. `GATE PASS` pada output berarti hanya bahwa dua quote minimum saat itu menutup formula ekonomi. Itu **bukan** tanda siap eksekusi: pair observer belum memiliki code instruction, transaction, simulation, ataupun execution.
 
-Batas default adalah 64 request Jupiter per putaran (dua quote per candidate). Default saat ini memakai 32 request per `scan:pairs`; `watch:pairs` menunggu `PAIR_POLL_MS` (default 30 detik) setelah satu putaran selesai agar tidak membanjiri public API. Tambahkan pair/mint/DEX lain hanya setelah memverifikasi mint, token program, likuiditas, dan label DEX Jupiter. Token-2022 sengaja ditolak pada fase observer ini agar transfer-fee atau extension token tidak membuat hitungan quote tidak lengkap.
+Batas default adalah 64 request Jupiter per putaran (dua quote per candidate). Default aktif memakai 48 request per `scan:pairs`; `watch:pairs` menunggu `PAIR_POLL_MS` (default 5 menit) setelah satu putaran selesai agar tidak membanjiri public API. Tambahkan pair/mint/DEX lain hanya setelah memverifikasi mint, token program, likuiditas, dan label DEX Jupiter. Token-2022 sengaja ditolak pada fase observer ini agar transfer-fee atau extension token tidak membuat hitungan quote tidak lengkap.
+
+Setiap hasil scan juga disimpan lokal ke `PAIR_OBSERVATION_LOG_DIR` sebagai dua file per hari UTC:
+
+```text
+pair-observations-YYYY-MM-DD.jsonl  # satu record lengkap per putaran scan
+pair-candidates-YYYY-MM-DD.csv      # satu baris per candidate
+```
+
+CSV memuat protected/optimistic quote output, venue, price impact, gross round-trip, flash fee, repayment, threshold minimum, dan net setelah budget. JSONL menyimpan record lengkap beserta raw atomic amount. Direktori `logs/` diabaikan Git dan tidak berisi keypair, signature, instruction, maupun transaction payload.
 
 ## Hot wallet tanpa Solana CLI
 
@@ -175,7 +186,7 @@ npm test
 npm run scan
 
 # Phase 5a: observasi pair DEX. Hanya quote + state Kamino: tidak memuat keypair,
-# tidak meminta instruction, tidak build/simulate/sign/send.
+# tidak meminta instruction, tidak build/simulate/sign/send. Hasil dicatat ke CSV + JSONL lokal.
 npm run scan:pairs
 npm run watch:pairs
 

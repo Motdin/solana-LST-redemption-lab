@@ -37,6 +37,8 @@ export type BotConfig = {
   pollMs: number;
   /** Slower default for a bounded but multi-quote public-API observer. */
   pairPollMs: number;
+  /** Local-only destination for CSV and JSONL pair-observation records. */
+  pairObservationLogDir: string;
   executionEnabled: boolean;
 };
 
@@ -149,7 +151,9 @@ export function loadConfig(
       10_000,
     ),
     pollMs: positiveInteger("POLL_MS", 5_000, 500),
-    pairPollMs: positiveInteger("PAIR_POLL_MS", 30_000, 5_000),
+    pairPollMs: positiveInteger("PAIR_POLL_MS", 300_000, 30_000),
+    pairObservationLogDir:
+      optional("PAIR_OBSERVATION_LOG_DIR") ?? "./logs/pair-observations",
     executionEnabled: bool("EXECUTION_ENABLED", false),
   };
 }

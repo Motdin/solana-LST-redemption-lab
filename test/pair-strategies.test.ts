@@ -1,3 +1,4 @@
+import { readFile } from "node:fs/promises";
 import { describe, expect, it } from "vitest";
 import { parsePairStrategies } from "../src/pair-strategies.js";
 
@@ -43,5 +44,32 @@ describe("pair strategy whitelist", () => {
         ),
       }),
     ).toThrow("exceed 64 Jupiter quotes");
+  });
+
+  it("keeps the default observer within its 64-quote budget and disables USDT", async () => {
+    const value = JSON.parse(
+      await readFile(
+        new URL("../pair-strategies.json", import.meta.url),
+        "utf8",
+      ),
+    ) as unknown;
+    const parsed = parsePairStrategies(value);
+    const enabled = parsed.filter((strategy) => strategy.enabled);
+
+    expect(enabled).toHaveLength(6);
+    expect(
+      enabled.reduce(
+        (total, strategy) => total + strategy.borrowAmountsRaw.length * 2,
+        0,
+      ),
+    ).toBe(48);
+    expect(
+      parsed.filter((strategy) => strategy.id.includes("usdt")),
+    ).toHaveLength(2);
+    expect(
+      parsed
+        .filter((strategy) => strategy.id.includes("usdt"))
+        .every((strategy) => !strategy.enabled),
+    ).toBe(true);
   });
 });

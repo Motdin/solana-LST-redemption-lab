@@ -17,8 +17,40 @@
       "borrowAmountsSol": ["0.5", "2.5", "5", "10"]
     },
     {
-      "id": "wsol-usdt-meteora-to-raydium",
+      "id": "wsol-usdc-meteora-to-orca",
       "enabled": true,
+      "intermediateMint": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+      "legOneDexes": ["Meteora DLMM"],
+      "legTwoDexes": ["Orca Whirlpool"],
+      "borrowAmountsSol": ["0.5", "2.5", "5", "10"]
+    },
+    {
+      "id": "wsol-usdc-orca-to-meteora",
+      "enabled": true,
+      "intermediateMint": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+      "legOneDexes": ["Orca Whirlpool"],
+      "legTwoDexes": ["Meteora DLMM"],
+      "borrowAmountsSol": ["0.5", "2.5", "5", "10"]
+    },
+    {
+      "id": "wsol-usdc-raydium-to-orca",
+      "enabled": true,
+      "intermediateMint": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+      "legOneDexes": ["Raydium CLMM"],
+      "legTwoDexes": ["Orca Whirlpool"],
+      "borrowAmountsSol": ["0.5", "2.5", "5", "10"]
+    },
+    {
+      "id": "wsol-usdc-orca-to-raydium",
+      "enabled": true,
+      "intermediateMint": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+      "legOneDexes": ["Orca Whirlpool"],
+      "legTwoDexes": ["Raydium CLMM"],
+      "borrowAmountsSol": ["0.5", "2.5", "5", "10"]
+    },
+    {
+      "id": "wsol-usdt-meteora-to-raydium",
+      "enabled": false,
       "intermediateMint": "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB",
       "legOneDexes": ["Meteora DLMM"],
       "legTwoDexes": ["Raydium CLMM"],
@@ -26,7 +58,7 @@
     },
     {
       "id": "wsol-usdt-raydium-to-meteora",
-      "enabled": true,
+      "enabled": false,
       "intermediateMint": "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB",
       "legOneDexes": ["Raydium CLMM"],
       "legTwoDexes": ["Meteora DLMM"],
