@@ -63,6 +63,7 @@ const observation: PairObservation = {
 const scan: PairScanResult = {
   scannedAt: new Date("2026-10-01T15:10:08.875Z"),
   runtime: {
+    market: {} as PairScanResult["runtime"]["market"],
     reserve: {} as PairScanResult["runtime"]["reserve"],
     availableLiquidityRaw: 221_488_398_311_788n,
   },

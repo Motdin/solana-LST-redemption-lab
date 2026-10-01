@@ -23,7 +23,7 @@ Kamino reference: WSOL flash principal + fee
 → nilai final minimum dibandingkan dengan repayment + budget
 ```
 
-Pair observer **hanya mengambil quote dan membaca state Kamino**. Ia tidak memuat keypair, meminta swap instruction, membangun transaksi, melakukan simulation, sign, atau send. Ia bukan scanner token bebas; seluruh mint dan label DEX harus ada pada allowlist publik yang Anda verifikasi sendiri.
+`scan:pairs` dan `watch:pairs` **hanya mengambil quote dan membaca state Kamino**. Keduanya tidak memuat keypair, meminta swap instruction, membangun transaksi, melakukan simulation, sign, atau send. Jika—dan hanya jika—quote protected yang baru memenuhi gate ekonomi, `plan:pairs` dapat membangun/sign lokal dan `simulate:pairs` dapat menjalankan simulation. Tidak ada command pair untuk send. Ia bukan scanner token bebas; seluruh mint dan label DEX harus ada pada allowlist publik yang Anda verifikasi sendiri.
 
 > [!WARNING]
 > Ini adalah software DeFi berisiko tinggi dan bukan jaminan profit. Pakai hot wallet terpisah dengan SOL terbatas untuk fee/rent. Jangan pernah membagikan seed phrase atau isi file keypair JSON. Semua execution mainnet adalah tanggung jawab operator.
@@ -34,7 +34,7 @@ Pair observer **hanya mengambil quote dan membaca state Kamino**. Ia tidak memua
 2. **Whitelist multi-pool** — tambahkan LST / SPL stake pool terverifikasi ke `strategies.json`.
 3. **Simulasi kandidat terbaik** — hanya kandidat dengan `net >= MIN_NET_PROFIT_SOL` yang dibangun dan disimulasikan.
 4. **Execution bergated** — send hanya ketika kandidat terbaik LST lulus scanner, build, simulation, `EXECUTION_ENABLED=true`, dan flag `--yes`.
-5. **DEX pair observer** — scan read-only `WSOL → stablecoin → WSOL` pada dua venue Jupiter yang disjoint. Tidak ada command execution untuk strategy ini.
+5. **DEX pair observer** — scan read-only `WSOL → stablecoin → WSOL` pada dua venue Jupiter yang disjoint; candidate yang lulus gate dapat di-build/simulate lokal, tanpa command execution.
 
 Tidak ada `MIN_LST_OUT`, `LST_TO_BURN`, atau `MIN_WITHDRAW_SOL` statis. Scanner LST memakai **Jupiter `otherAmountThreshold`** sebagai jumlah LST yang dibakar, lalu menghitung kembali NAV/withdraw fee stake pool. Pair observer memakai threshold leg pertama sebagai input leg kedua dan hanya menilai threshold WSOL akhir. Keduanya memakai gate dinamis:
 
@@ -91,7 +91,7 @@ PAIR_POLL_MS=300000
 PAIR_OBSERVATION_LOG_DIR=./logs/pair-observations
 ```
 
-`scan:pairs` dan `watch:pairs` hanya membutuhkan `RPC_URL`, market/reserve Kamino, serta konfigurasi Jupiter. Keduanya tidak membaca `KEYPAIR_PATH`; variabel tersebut tetap diperlukan untuk command LST `scan`, `plan`, `simulate`, `execute`, dan `watch`.
+`scan:pairs` dan `watch:pairs` hanya membutuhkan `RPC_URL`, market/reserve Kamino, serta konfigurasi Jupiter. Keduanya tidak membaca `KEYPAIR_PATH`. `plan:pairs` dan `simulate:pairs` membutuhkan keypair untuk signature lokal dan tetap memeriksa `MIN_GAS_BALANCE_SOL`; keduanya tidak dapat mengirim transaksi. `KEYPAIR_PATH` juga tetap diperlukan untuk command LST `scan`, `plan`, `simulate`, `execute`, dan `watch`.
 
 `KAMINO_WSOL_RESERVE` adalah optional safety pin. Untuk memverifikasi reserve dari market tanpa private key:
 
@@ -146,7 +146,7 @@ Hanya `otherAmountThreshold` dari kedua quote yang dipakai. Output final protect
 flash principal + Kamino fee aktual + MAX_TX_COST_SOL + MIN_NET_PROFIT_SOL
 ```
 
-Kelebihan output aktual leg pertama di atas minimum tidak dihitung sebagai profit; ini menjaga hasil observasi konservatif. `GATE PASS` pada output berarti hanya bahwa dua quote minimum saat itu menutup formula ekonomi. Itu **bukan** tanda siap eksekusi: pair observer belum memiliki code instruction, transaction, simulation, ataupun execution.
+Kelebihan output aktual leg pertama di atas minimum tidak dihitung sebagai profit; ini menjaga hasil observasi konservatif. `GATE PASS` berarti dua quote minimum saat itu menutup formula ekonomi. Ini hanya membuka `plan:pairs` dan `simulate:pairs`, yang memaksa scan ulang, memakai threshold yang sama di Jupiter instruction, dan tidak memiliki jalur send. Itu **bukan** tanda siap eksekusi.
 
 Batas default adalah 64 request Jupiter per putaran (dua quote per candidate). Default aktif memakai 48 request per `scan:pairs`; `watch:pairs` menunggu `PAIR_POLL_MS` (default 5 menit) setelah satu putaran selesai agar tidak membanjiri public API. Tambahkan pair/mint/DEX lain hanya setelah memverifikasi mint, token program, likuiditas, dan label DEX Jupiter. Token-2022 sengaja ditolak pada fase observer ini agar transfer-fee atau extension token tidak membuat hitungan quote tidak lengkap.
 
@@ -190,6 +190,11 @@ npm run scan
 npm run scan:pairs
 npm run watch:pairs
 
+# Phase 5b: hanya jika scan yang baru menghasilkan GATE PASS. Membuat transaction
+# ter-sign lokal untuk inspeksi atau simulation, tetapi tidak memiliki send path.
+npm run plan:pairs
+npm run simulate:pairs
+
 # Build candidate LST paling menguntungkan; tidak simulate/send
 npm run plan
 
@@ -220,8 +225,8 @@ Command membaca `RPC_URL` dan `KEYPAIR_PATH`, memeriksa saldo, lalu secara defau
 ## Batasan penting
 
 - Mainnet-only.
-- Pair observer sengaja tidak bisa di-upgrade menjadi execution melalui `.env`, `--yes`, atau command tersembunyi; tidak ada path instruction/transaction untuk pair strategy pada versi ini.
-- Pair observer membandingkan dua quote pada waktu berbeda. Perubahan slot, quote expiry, MEV, dan slippage berarti `GATE PASS` adalah sinyal riset, bukan peluang yang dapat langsung dieksekusi.
+- Pair strategy sengaja tidak memiliki execution/send command, bahkan bila `EXECUTION_ENABLED=true` atau `--yes` diberikan. Hanya `plan:pairs` dan `simulate:pairs` yang tersedia, dan keduanya membutuhkan `GATE PASS` dari scan baru.
+- Pair observer membandingkan dua quote pada waktu berbeda. Perubahan slot, quote expiry, MEV, dan slippage berarti `GATE PASS` adalah sinyal riset; simulation terbaru adalah pemeriksaan berikutnya, bukan peluang yang dapat langsung dieksekusi.
 - `WithdrawSol` memakai stake-pool reserve dan dapat gagal bila reserve tidak cukup, bahkan jika preview sebelumnya cukup; simulasi terbaru adalah validasi terakhir sebelum send.
 - SPL `WithdrawSol` versi standar pada SDK ini tidak membawa minimum-output parameter on-chain. Bot menggunakan quote minimum, estimasi konservatif, gate profit, dan full simulation; tetap ada risiko perubahan state antara simulation dan landing.
 - Quote profitable bukan jaminan transaction landing. Priority fee, account size, MEV, liquidity, dan state slot bisa berubah.

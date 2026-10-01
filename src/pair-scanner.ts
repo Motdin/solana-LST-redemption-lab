@@ -16,6 +16,7 @@ import { selectWsolReserve } from "./scanner.js";
 import { TOKEN_PROGRAM_ID } from "./token.js";
 
 export type PairScannerRuntime = {
+  market: KaminoMarket;
   reserve: KaminoReserve;
   availableLiquidityRaw: bigint;
 };
@@ -284,6 +285,7 @@ export async function scanPairArbOpportunities(args: {
   }
   const reserve = selectWsolReserve(market, config);
   const runtime: PairScannerRuntime = {
+    market,
     reserve,
     availableLiquidityRaw: BigInt(
       reserve.getLiquidityAvailableAmount().floor().toFixed(0),
@@ -318,4 +320,31 @@ export function rankPairObservations(
       ? -1
       : 1;
   });
+}
+
+/**
+ * Pair plans are intentionally limited to a current, protected-quote candidate
+ * that clears the same repayment/cost/profit gate as the observer. Building a
+ * losing cycle just to simulate it is refused.
+ */
+export function requireBestPairCandidate(args: {
+  scan: PairScanResult;
+  config: BotConfig;
+  walletBalanceRaw: bigint;
+}): PairObservation {
+  const { scan, config, walletBalanceRaw } = args;
+  if (walletBalanceRaw < config.minGasBalanceRaw) {
+    throw new Error(
+      `Wallet needs at least ${formatAtomic(config.minGasBalanceRaw, SOL_DECIMALS)} SOL for ATA rent and transaction fees`,
+    );
+  }
+  const best = rankPairObservations(scan.candidates).find(
+    (candidate) => candidate.passesEconomicGate,
+  );
+  if (!best) {
+    throw new Error(
+      "No economically eligible pair candidate in this scan; pair planning and simulation remain disabled",
+    );
+  }
+  return best;
 }

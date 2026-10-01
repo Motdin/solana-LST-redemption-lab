@@ -7,6 +7,8 @@
   "scripts": {
     "scan": "tsx src/cli.ts scan",
     "scan:pairs": "tsx src/cli.ts scan:pairs",
+    "plan:pairs": "tsx src/cli.ts plan:pairs",
+    "simulate:pairs": "tsx src/cli.ts simulate:pairs",
     "watch:pairs": "tsx src/cli.ts watch:pairs",
     "plan": "tsx src/cli.ts plan",
     "simulate": "tsx src/cli.ts simulate",

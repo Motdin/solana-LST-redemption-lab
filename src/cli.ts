@@ -7,10 +7,16 @@ import {
 } from "./bot.js";
 import { formatAtomic } from "./amount.js";
 import { loadConfig, SOL_DECIMALS } from "./config.js";
+import {
+  buildFlashPairPlan,
+  pairPlanSummary,
+  simulateFlashPairPlan,
+} from "./pair-bot.js";
 import { appendPairObservationLogs } from "./pair-observation-log.js";
 import {
   isPairObservation,
   rankPairObservations,
+  requireBestPairCandidate,
   scanPairArbOpportunities,
   type PairScanResult,
 } from "./pair-scanner.js";
@@ -39,6 +45,8 @@ Commands:
   npm run scan                    Quote every LST redemption whitelist entry; never builds, signs, or sends
   npm run scan:pairs              Observe DEX-to-DEX WSOL cycles; quotes only, never builds/signs/sends
   npm run watch:pairs             Re-scan pair observations at PAIR_POLL_MS; quotes only, never builds/signs/sends
+  npm run plan:pairs              Build + locally sign a current gate-passing pair plan; never simulates/sends
+  npm run simulate:pairs          Build + locally simulate a current gate-passing pair plan; never sends
   npm run plan                    Build only the highest-ranked dynamic candidate; never sends
   npm run simulate                Build + simulate the highest-ranked dynamic candidate; never sends
   npm run execute -- --yes        Scan, simulate, then send the top candidate (requires EXECUTION_ENABLED=true)
@@ -46,10 +54,11 @@ Commands:
                                   Re-scan at POLL_MS. Observe-only by default.
 
 LST redemption strategies are public whitelist entries in STRATEGIES_FILE.
-Pair observations are public, read-only entries in PAIR_STRATEGIES_FILE and have no
-plan, simulation, or execution path. Every scan uses protected Jupiter minima and
-requires repayment + fee budget + MIN_NET_PROFIT_SOL. Keep EXECUTION_ENABLED=false
-until LST redemption simulations are understood.
+Pair observations are public entries in PAIR_STRATEGIES_FILE. Pair plans may only
+be built/simulated after a current protected quote clears the economic gate; there
+is no pair execution path. Every scan uses protected Jupiter minima and requires
+repayment + fee budget + MIN_NET_PROFIT_SOL. Keep EXECUTION_ENABLED=false until
+LST redemption simulations are understood.
 `);
 }
 
@@ -85,6 +94,20 @@ async function getPairRuntime() {
     disableRetryOnRateLimit: false,
   });
   return { config, strategies, connection };
+}
+
+/** Pair build/simulation is local-only, but needs the wallet signature and rent balance. */
+async function getPairBuildRuntime() {
+  const config = loadConfig();
+  const [wallet, strategies] = await Promise.all([
+    loadKeypair(config.keypairPath),
+    loadPairStrategies(config.pairStrategiesFile),
+  ]);
+  const connection = new Connection(config.rpcUrl, {
+    commitment: "processed",
+    disableRetryOnRateLimit: false,
+  });
+  return { config, wallet, strategies, connection };
 }
 
 function printCandidateSummary(scan: ScanResult): void {
@@ -219,6 +242,12 @@ function printPlanSummary(summary: ReturnType<typeof planSummary>): void {
   console.table(summary);
 }
 
+function printPairPlanSummary(
+  summary: ReturnType<typeof pairPlanSummary>,
+): void {
+  console.table(summary);
+}
+
 async function scan(runtime: Runtime): Promise<ScanResult> {
   const result = await scanFlashRedeemOpportunities({
     connection: runtime.connection,
@@ -238,6 +267,42 @@ async function runPairObservationOnce(): Promise<void> {
     strategies: runtime.strategies,
   });
   await printAndLogPairObservation({ scan: result, config: runtime.config });
+}
+
+async function runPairBuild(
+  mode: "plan:pairs" | "simulate:pairs",
+): Promise<void> {
+  const runtime = await getPairBuildRuntime();
+  console.log(`Pair planner wallet: ${runtime.wallet.publicKey.toBase58()}`);
+  const result = await scanPairArbOpportunities({
+    connection: runtime.connection,
+    config: runtime.config,
+    strategies: runtime.strategies,
+  });
+  await printAndLogPairObservation({ scan: result, config: runtime.config });
+
+  const walletBalanceRaw = BigInt(
+    await runtime.connection.getBalance(runtime.wallet.publicKey, "processed"),
+  );
+  const candidate = requireBestPairCandidate({
+    scan: result,
+    config: runtime.config,
+    walletBalanceRaw,
+  });
+  const plan = await buildFlashPairPlan({
+    connection: runtime.connection,
+    wallet: runtime.wallet,
+    config: runtime.config,
+    runtime: result.runtime,
+    candidate,
+  });
+  printPairPlanSummary(pairPlanSummary(plan));
+  if (mode === "plan:pairs") return;
+
+  const simulation = await simulateFlashPairPlan(runtime.connection, plan);
+  console.log(
+    `Pair simulation succeeded${simulation.unitsConsumed ? `; ${simulation.unitsConsumed} compute units` : ""}. No transaction was sent.`,
+  );
 }
 
 async function watchPairObservations(): Promise<void> {
@@ -344,6 +409,12 @@ async function main(): Promise<void> {
       return;
     case "scan:pairs":
       await runPairObservationOnce();
+      return;
+    case "plan:pairs":
+      await runPairBuild("plan:pairs");
+      return;
+    case "simulate:pairs":
+      await runPairBuild("simulate:pairs");
       return;
     case "watch:pairs":
       await watchPairObservations();

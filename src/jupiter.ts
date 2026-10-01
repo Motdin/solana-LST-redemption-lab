@@ -200,17 +200,19 @@ export async function getJupiterSwapPlan(args: {
   config: BotConfig;
   quote: JupiterQuote;
   wallet: PublicKey;
-  destinationLstAccount: PublicKey;
+  /** Explicit ATA receiving the quote output; Jupiter never chooses it. */
+  destinationTokenAccount: PublicKey;
   kaminoProgram: PublicKey;
 }): Promise<JupiterSwapPlan> {
-  const { config, quote, wallet, destinationLstAccount, kaminoProgram } = args;
+  const { config, quote, wallet, destinationTokenAccount, kaminoProgram } =
+    args;
   const response = await fetch(`${config.jupiterApiBase}/swap-instructions`, {
     method: "POST",
     headers: apiHeaders(config),
     body: JSON.stringify({
       quoteResponse: quote,
       userPublicKey: wallet.toBase58(),
-      destinationTokenAccount: destinationLstAccount.toBase58(),
+      destinationTokenAccount: destinationTokenAccount.toBase58(),
       wrapAndUnwrapSol: false,
       useSharedAccounts: false,
       dynamicComputeUnitLimit: false,

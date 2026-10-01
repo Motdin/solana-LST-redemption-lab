@@ -5,7 +5,6 @@ import {
   Connection,
   Keypair,
   PublicKey,
-  SystemProgram,
   TransactionInstruction,
   TransactionMessage,
   VersionedTransaction,
@@ -14,21 +13,20 @@ import {
   PROGRAM_ID,
   getFlashLoanInstructions,
 } from "@kamino-finance/klend-sdk";
-import { formatAtomic, toSafeNumber } from "./amount.js";
+import { formatAtomic } from "./amount.js";
 import { type BotConfig, SOL_DECIMALS, WSOL_MINT } from "./config.js";
-import {
-  createAssociatedTokenAccountIdempotentInstruction,
-  createSyncNativeInstruction,
-  deriveAssociatedTokenAddress,
-} from "./token.js";
 import { getJupiterSwapPlan } from "./jupiter.js";
 import {
-  buildUpdateStakePoolBalanceInstruction,
-  buildWithdrawSolInstruction,
-} from "./stake-pool.js";
-import type { EligibleCandidate, ScannerRuntime } from "./scanner.js";
+  type PairObservation,
+  type PairScannerRuntime,
+} from "./pair-scanner.js";
+import {
+  createAssociatedTokenAccountIdempotentInstruction,
+  deriveAssociatedTokenAddress,
+  TOKEN_PROGRAM_ID,
+} from "./token.js";
 
-export type FlashRedeemPlan = {
+export type FlashPairPlan = {
   transaction: VersionedTransaction;
   blockhash: string;
   lastValidBlockHeight: number;
@@ -37,18 +35,16 @@ export type FlashRedeemPlan = {
   flashBorrowRaw: bigint;
   flashFeeRaw: bigint;
   flashRepaymentRaw: bigint;
-  quoteOutRaw: bigint;
-  quoteMinimumOutRaw: bigint;
-  lstToBurnRaw: bigint;
-  lstDecimals: number;
-  expectedWithdrawRaw: bigint;
+  protectedIntermediateRaw: bigint;
+  intermediateDecimals: number;
+  protectedFinalWsolRaw: bigint;
+  targetMinimumFinalWsolRaw: bigint;
   expectedNetBeforeNetworkRaw: bigint;
   expectedNetAfterBudgetRaw: bigint;
-  targetMinimumWithdrawRaw: bigint;
   instructions: TransactionInstruction[];
-  routeLabels: string[];
+  firstRouteLabels: string[];
+  secondRouteLabels: string[];
   reserve: string;
-  stakePool: string;
 };
 
 function assert(condition: unknown, message: string): asserts condition {
@@ -78,53 +74,94 @@ async function getLookupTables(
   });
 }
 
+function uniqueLookupTableAddresses(addresses: PublicKey[]): PublicKey[] {
+  const unique = new Map<string, PublicKey>();
+  for (const address of addresses) unique.set(address.toBase58(), address);
+  return [...unique.values()];
+}
+
+function assertPairCandidate(candidate: PairObservation): void {
+  const { strategy } = candidate;
+  assert(
+    candidate.firstQuote.inputMint === WSOL_MINT.toBase58() &&
+      candidate.firstQuote.outputMint === strategy.intermediateMint.toBase58(),
+    "Pair candidate has mismatched leg-one Jupiter mints",
+  );
+  assert(
+    candidate.firstQuote.inAmount === candidate.borrowRaw.toString(),
+    "Pair candidate has mismatched leg-one Jupiter input",
+  );
+  assert(
+    BigInt(candidate.firstQuote.otherAmountThreshold) ===
+      candidate.protectedIntermediateRaw,
+    "Pair candidate has mismatched protected intermediate output",
+  );
+  assert(
+    candidate.secondQuote.inputMint === strategy.intermediateMint.toBase58() &&
+      candidate.secondQuote.outputMint === WSOL_MINT.toBase58(),
+    "Pair candidate has mismatched leg-two Jupiter mints",
+  );
+  assert(
+    candidate.secondQuote.inAmount ===
+      candidate.protectedIntermediateRaw.toString(),
+    "Pair candidate must spend exactly the protected leg-one output",
+  );
+  assert(
+    BigInt(candidate.secondQuote.otherAmountThreshold) ===
+      candidate.protectedFinalWsolRaw,
+    "Pair candidate has mismatched protected final WSOL output",
+  );
+  assert(
+    candidate.passesEconomicGate,
+    "Refusing to build a pair candidate that does not clear the economic gate",
+  );
+}
+
 /**
- * Builds the exact top-ranked scanner candidate. The candidate burns Jupiter's
- * slippage-protected LST minimum, so its economic estimate is conservative.
+ * Builds, signs locally, and returns a two-swap flash-loan transaction for an
+ * already-qualified pair observation. This module deliberately exports no send
+ * path: callers may inspect or simulate the transaction only.
  */
-export async function buildFlashRedeemPlan(args: {
+export async function buildFlashPairPlan(args: {
   connection: Connection;
   wallet: Keypair;
   config: BotConfig;
-  runtime: ScannerRuntime;
-  candidate: EligibleCandidate;
-}): Promise<FlashRedeemPlan> {
+  runtime: PairScannerRuntime;
+  candidate: PairObservation;
+}): Promise<FlashPairPlan> {
   const { connection, wallet, config, runtime, candidate } = args;
+  assertPairCandidate(candidate);
+
   const walletAddress = wallet.publicKey;
-  const { pool, strategy } = candidate;
-
-  assert(
-    candidate.quote.inputMint === WSOL_MINT.toBase58() &&
-      candidate.quote.outputMint === strategy.lstMint.toBase58(),
-    "Scanner candidate has mismatched Jupiter mints",
-  );
-  assert(
-    candidate.quote.inAmount === candidate.borrowRaw.toString(),
-    "Scanner candidate has mismatched Jupiter input",
-  );
-  assert(
-    candidate.quoteMinimumOutRaw === candidate.lstToBurnRaw,
-    "Scanner candidate must burn its protected Jupiter minimum",
-  );
-
   const wsolTokenProgram = runtime.reserve.getLiquidityTokenProgram();
   const wsolAta = deriveAssociatedTokenAddress(
     WSOL_MINT,
     walletAddress,
     wsolTokenProgram,
   );
-  const lstAta = deriveAssociatedTokenAddress(
-    strategy.lstMint,
+  // Pair scanning intentionally accepts only legacy SPL intermediate mints.
+  const intermediateAta = deriveAssociatedTokenAddress(
+    candidate.strategy.intermediateMint,
     walletAddress,
-    pool.state.tokenProgramId,
+    TOKEN_PROGRAM_ID,
   );
-  const swap = await getJupiterSwapPlan({
-    config,
-    quote: candidate.quote,
-    wallet: walletAddress,
-    destinationTokenAccount: lstAta,
-    kaminoProgram: PROGRAM_ID,
-  });
+
+  const [firstSwap, secondSwap] = await Promise.all([
+    getJupiterSwapPlan({
+      config,
+      quote: candidate.firstQuote,
+      wallet: walletAddress,
+      destinationTokenAccount: intermediateAta,
+      kaminoProgram: PROGRAM_ID,
+    }),
+    getJupiterSwapPlan({
+      config,
+      quote: candidate.secondQuote,
+      wallet: walletAddress,
+      destinationTokenAccount: wsolAta,
+      kaminoProgram: PROGRAM_ID,
+    }),
+  ]);
 
   const preInstructions: TransactionInstruction[] = [
     ComputeBudgetProgram.setComputeUnitLimit({
@@ -142,10 +179,10 @@ export async function buildFlashRedeemPlan(args: {
     }),
     createAssociatedTokenAccountIdempotentInstruction({
       payer: walletAddress,
-      associatedToken: lstAta,
+      associatedToken: intermediateAta,
       owner: walletAddress,
-      mint: strategy.lstMint,
-      tokenProgram: pool.state.tokenProgramId,
+      mint: candidate.strategy.intermediateMint,
+      tokenProgram: TOKEN_PROGRAM_ID,
     }),
   ];
   const flashBorrowInstructionIndex = preInstructions.length;
@@ -166,33 +203,23 @@ export async function buildFlashRedeemPlan(args: {
   const instructions = [
     ...preInstructions,
     flashBorrowIxn,
-    ...swap.setupInstructions,
-    ...swap.swapInstructions,
-    buildUpdateStakePoolBalanceInstruction(pool),
-    buildWithdrawSolInstruction({
-      pool,
-      wallet: walletAddress,
-      sourceLstAccount: lstAta,
-      poolTokens: candidate.lstToBurnRaw,
-    }),
-    SystemProgram.transfer({
-      fromPubkey: walletAddress,
-      toPubkey: wsolAta,
-      lamports: toSafeNumber(
-        candidate.economics.flashRepaymentRaw,
-        "Kamino repayment",
-      ),
-    }),
-    createSyncNativeInstruction(wsolAta, wsolTokenProgram),
+    ...firstSwap.setupInstructions,
+    ...firstSwap.swapInstructions,
+    ...secondSwap.setupInstructions,
+    ...secondSwap.swapInstructions,
     flashRepayIxn,
   ];
   assert(
     instructions[flashBorrowInstructionIndex]?.programId.equals(PROGRAM_ID),
-    "Internal error: Kamino borrow instruction index no longer matches the compiled flow",
+    "Internal error: Kamino borrow instruction index no longer matches the compiled pair flow",
   );
 
+  const lookupTableAddresses = uniqueLookupTableAddresses([
+    ...firstSwap.lookupTableAddresses,
+    ...secondSwap.lookupTableAddresses,
+  ]);
   const [lookupTables, latestBlockhash] = await Promise.all([
-    getLookupTables(connection, swap.lookupTableAddresses),
+    getLookupTables(connection, lookupTableAddresses),
     connection.getLatestBlockhash("processed"),
   ]);
   const message = new TransactionMessage({
@@ -207,30 +234,28 @@ export async function buildFlashRedeemPlan(args: {
     transaction,
     blockhash: latestBlockhash.blockhash,
     lastValidBlockHeight: latestBlockhash.lastValidBlockHeight,
-    strategyId: strategy.id,
+    strategyId: candidate.strategy.id,
     flashBorrowInstructionIndex,
     flashBorrowRaw: candidate.borrowRaw,
     flashFeeRaw: candidate.economics.flashFeeRaw,
     flashRepaymentRaw: candidate.economics.flashRepaymentRaw,
-    quoteOutRaw: candidate.quoteOutRaw,
-    quoteMinimumOutRaw: candidate.quoteMinimumOutRaw,
-    lstToBurnRaw: candidate.lstToBurnRaw,
-    lstDecimals: pool.poolTokenDecimals,
-    expectedWithdrawRaw: candidate.expectedWithdrawRaw,
+    protectedIntermediateRaw: candidate.protectedIntermediateRaw,
+    intermediateDecimals: candidate.intermediateDecimals,
+    protectedFinalWsolRaw: candidate.protectedFinalWsolRaw,
+    targetMinimumFinalWsolRaw: candidate.economics.minimumFinalOutputRaw,
     expectedNetBeforeNetworkRaw:
       candidate.economics.expectedNetBeforeNetworkRaw,
     expectedNetAfterBudgetRaw: candidate.economics.expectedNetAfterBudgetRaw,
-    targetMinimumWithdrawRaw: candidate.economics.minimumWithdrawRaw,
     instructions,
-    routeLabels: swap.routeLabels,
+    firstRouteLabels: firstSwap.routeLabels,
+    secondRouteLabels: secondSwap.routeLabels,
     reserve: runtime.reserve.address.toBase58(),
-    stakePool: pool.address.toBase58(),
   };
 }
 
-export async function simulatePlan(
+export async function simulateFlashPairPlan(
   connection: Connection,
-  plan: FlashRedeemPlan,
+  plan: FlashPairPlan,
 ): Promise<{ unitsConsumed?: number; logs: string[] }> {
   const simulation = await connection.simulateTransaction(plan.transaction, {
     sigVerify: false,
@@ -240,7 +265,7 @@ export async function simulatePlan(
   if (simulation.value.err) {
     const logs = simulation.value.logs ?? [];
     throw new Error(
-      `Simulation failed: ${JSON.stringify(simulation.value.err)}\n${logs.join("\n")}`,
+      `Pair simulation failed: ${JSON.stringify(simulation.value.err)}\n${logs.join("\n")}`,
     );
   }
   return {
@@ -249,52 +274,23 @@ export async function simulatePlan(
   };
 }
 
-export async function sendPlan(
-  connection: Connection,
-  plan: FlashRedeemPlan,
-): Promise<string> {
-  const signature = await connection.sendRawTransaction(
-    plan.transaction.serialize(),
-    {
-      skipPreflight: true,
-      maxRetries: 0,
-    },
-  );
-  const confirmation = await connection.confirmTransaction(
-    {
-      signature,
-      blockhash: plan.blockhash,
-      lastValidBlockHeight: plan.lastValidBlockHeight,
-    },
-    "confirmed",
-  );
-  if (confirmation.value.err) {
-    throw new Error(
-      `Transaction ${signature} confirmed with error: ${JSON.stringify(confirmation.value.err)}`,
-    );
-  }
-  return signature;
-}
-
-export function planSummary(
-  plan: FlashRedeemPlan,
+export function pairPlanSummary(
+  plan: FlashPairPlan,
 ): Record<string, string | number | string[]> {
   return {
     Strategy: plan.strategyId,
     "Kamino WSOL reserve": plan.reserve,
-    "LST stake pool": plan.stakePool,
     "Flash borrow": `${formatAtomic(plan.flashBorrowRaw, SOL_DECIMALS)} WSOL`,
     "Kamino flash fee (on-chain)": `${formatAtomic(plan.flashFeeRaw, SOL_DECIMALS)} WSOL`,
     "Flash repayment": `${formatAtomic(plan.flashRepaymentRaw, SOL_DECIMALS)} WSOL`,
-    "Jupiter quote output": `${formatAtomic(plan.quoteOutRaw, plan.lstDecimals)} LST`,
-    "Jupiter protected output": `${formatAtomic(plan.quoteMinimumOutRaw, plan.lstDecimals)} LST`,
-    "LST burned": `${formatAtomic(plan.lstToBurnRaw, plan.lstDecimals)} LST`,
-    "WithdrawSol expected": `${formatAtomic(plan.expectedWithdrawRaw, SOL_DECIMALS)} SOL`,
-    "Dynamic repayment/profit gate": `${formatAtomic(plan.targetMinimumWithdrawRaw, SOL_DECIMALS)} SOL`,
-    "Expected net before network": `${formatAtomic(plan.expectedNetBeforeNetworkRaw, SOL_DECIMALS)} SOL`,
-    "Expected net after fee budget": `${formatAtomic(plan.expectedNetAfterBudgetRaw, SOL_DECIMALS)} SOL`,
+    "Protected intermediate": `${formatAtomic(plan.protectedIntermediateRaw, plan.intermediateDecimals)}`,
+    "Protected final WSOL": `${formatAtomic(plan.protectedFinalWsolRaw, SOL_DECIMALS)} WSOL`,
+    "Dynamic repayment/profit gate": `${formatAtomic(plan.targetMinimumFinalWsolRaw, SOL_DECIMALS)} WSOL`,
+    "Expected net before network": `${formatAtomic(plan.expectedNetBeforeNetworkRaw, SOL_DECIMALS)} WSOL`,
+    "Expected net after fee budget": `${formatAtomic(plan.expectedNetAfterBudgetRaw, SOL_DECIMALS)} WSOL`,
     "Kamino borrow instruction index": plan.flashBorrowInstructionIndex,
-    "Jupiter route": plan.routeLabels,
+    "Jupiter leg one route": plan.firstRouteLabels,
+    "Jupiter leg two route": plan.secondRouteLabels,
     "Instruction count": plan.instructions.length,
   };
 }
