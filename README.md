@@ -59,6 +59,16 @@ npm run wallet:create
 
 Secara default file dibuat di `~/.config/solana/flash-bot.json`; gunakan `npm run wallet:create -- --output <path>` untuk memilih lokasi lain. Command menolak overwrite file yang sudah ada dan hanya menampilkan public address. Masukkan path yang dicetak ke `KEYPAIR_PATH`, lalu transfer SOL kecil untuk gas. Jangan simpan keypair di folder repo atau membagikan isi file JSON-nya.
 
+### Mengirim profit SOL tanpa Solana CLI
+
+Profit bersih tetap berada di hot wallet bot setelah transaksi sukses. Untuk mengirim SOL dari keypair lokal itu ke wallet penerima tanpa mengungkapkan private key, gunakan:
+
+```bash
+npm run wallet:send-sol -- --to <PUBLIC_ADDRESS_PENERIMA> --amount 0.1 --yes
+```
+
+Command meminta `RPC_URL` dan `KEYPAIR_PATH` dari `.env`, mengecek saldo terlebih dahulu, dan secara default menyisakan `0.02 SOL` ditambah buffer fee `0.0001 SOL` di hot wallet. Ubah saldo yang disisakan dengan `--keep 0.05` atau `PAYOUT_KEEP_SOL=0.05`. Periksa address penerima dan nominal sebelum menambahkan `--yes`; transfer SOL yang telah confirmed tidak dapat dibatalkan.
+
 ## Menjalankan
 
 ```bash
