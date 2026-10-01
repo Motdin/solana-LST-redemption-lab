@@ -78,7 +78,9 @@ npm run inspect:reserve
 
 ## Whitelist strategi
 
-`strategies.json` adalah file publik tanpa secret. Default hanya berisi mrgnFi LST:
+`strategies.json` adalah file publik tanpa secret. Default memasukkan tiga pool SPL stake-pool yang akan tetap diverifikasi on-chain pada setiap scan: mrgnFi LST, JitoSOL, dan bSOL. Jika suatu pool memasang authority WithdrawSol atau reserve SOL-nya tidak cukup, scanner hanya menandainya `rejected` dan tidak akan membangun transaksi.
+
+Contoh entry:
 
 ```json
 {

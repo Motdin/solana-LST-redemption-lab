@@ -6,6 +6,20 @@
       "lstMint": "LSTxxxnJzKDFSLr4dUkPcmCf5VyryEqzPLz5j4bpxFp",
       "stakePool": "DqhH94PjkZsjAqEze2BEkWhFQJ6EyU6MdtMphMgnXqeK",
       "borrowAmountsSol": ["0.25", "0.5", "1", "2.5", "5", "10"]
+    },
+    {
+      "id": "jitosol-redemption",
+      "enabled": true,
+      "lstMint": "J1toso1uCk3RLmjorhTtrVwY9HJ7X8V9yYac6Y7kGCPn",
+      "stakePool": "Jito4APyf642JPZPx3hGc6WWJ8zPKtRbRs4P815Awbb",
+      "borrowAmountsSol": ["0.25", "0.5", "1", "2.5", "5", "10"]
+    },
+    {
+      "id": "bsol-redemption",
+      "enabled": true,
+      "lstMint": "bSo13r4TkiE4KumL71LsHTPpL2euBYLFx6h9HP3piy1",
+      "stakePool": "stk9ApL5HeVAwPLr3TLhDXdZS8ptVu7zp6ov8HFDuMi",
+      "borrowAmountsSol": ["0.25", "0.5", "1", "2.5", "5", "10"]
     }
   ]
 }
