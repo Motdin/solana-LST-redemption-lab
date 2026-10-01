@@ -5,6 +5,7 @@
   "description": "Atomic Kamino WSOL flash-loan → marginfi LST redemption bot",
   "type": "module",
   "scripts": {
+    "scan": "tsx src/cli.ts scan",
     "plan": "tsx src/cli.ts plan",
     "simulate": "tsx src/cli.ts simulate",
     "execute": "tsx src/cli.ts execute",

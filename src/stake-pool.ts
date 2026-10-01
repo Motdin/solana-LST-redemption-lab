@@ -14,6 +14,7 @@ export type LoadedStakePool = {
   withdrawAuthority: PublicKey;
   reserveLamports: bigint;
   currentEpoch: bigint;
+  poolTokenDecimals: number;
 };
 
 function bnToBigInt(value: BN): bigint {
@@ -39,10 +40,25 @@ export async function loadStakePool(
     [address.toBuffer(), Buffer.from("withdraw")],
     STAKE_POOL_PROGRAM_ID,
   );
-  const [reserveBalance, epochInfo] = await Promise.all([
+  const [reserveBalance, epochInfo, poolMintAccount] = await Promise.all([
     connection.getBalance(state.reserveStake, "processed"),
     connection.getEpochInfo("processed"),
+    connection.getAccountInfo(state.poolMint, "processed"),
   ]);
+  if (
+    !poolMintAccount ||
+    !poolMintAccount.owner.equals(state.tokenProgramId) ||
+    poolMintAccount.data.length < 45
+  ) {
+    throw new Error(
+      `Stake pool ${address.toBase58()} has an invalid pool-token mint account`,
+    );
+  }
+  // SPL Mint layout stores `decimals` at offset 44. Legacy Token and Token-2022
+  // share this base Mint layout, while the owner check above binds it to the pool.
+  const poolTokenDecimals = poolMintAccount.data[44];
+  if (poolTokenDecimals === undefined)
+    throw new Error("Could not read stake-pool token decimals");
 
   return {
     address,
@@ -50,6 +66,7 @@ export async function loadStakePool(
     withdrawAuthority,
     reserveLamports: BigInt(reserveBalance),
     currentEpoch: BigInt(epochInfo.epoch),
+    poolTokenDecimals,
   };
 }
 
@@ -93,6 +110,21 @@ export function buildUpdateStakePoolBalanceInstruction(
   });
 }
 
+/** Reject pools that require an authority the scanner wallet does not control. */
+export function assertSolWithdrawPermission(
+  pool: LoadedStakePool,
+  wallet: PublicKey,
+): void {
+  if (
+    pool.state.solWithdrawAuthority &&
+    !pool.state.solWithdrawAuthority.equals(wallet)
+  ) {
+    throw new Error(
+      `Pool requires SOL withdrawal authority ${pool.state.solWithdrawAuthority.toBase58()}; this bot only supports a wallet-owned, permissionless pool`,
+    );
+  }
+}
+
 /**
  * Burns the exact LST input and withdraws immediately-liquid SOL from the
  * reserve. This uses the wallet as the token authority, avoiding a temporary
@@ -105,14 +137,7 @@ export function buildWithdrawSolInstruction(args: {
   poolTokens: bigint;
 }): TransactionInstruction {
   const { pool, wallet, sourceLstAccount, poolTokens } = args;
-  if (
-    pool.state.solWithdrawAuthority &&
-    !pool.state.solWithdrawAuthority.equals(wallet)
-  ) {
-    throw new Error(
-      `Pool requires SOL withdrawal authority ${pool.state.solWithdrawAuthority.toBase58()}; this bot only supports a wallet-owned, permissionless pool`,
-    );
-  }
+  assertSolWithdrawPermission(pool, wallet);
 
   if (poolTokens > BigInt(Number.MAX_SAFE_INTEGER)) {
     throw new Error(

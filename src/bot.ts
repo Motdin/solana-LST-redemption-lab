@@ -11,10 +11,8 @@ import {
   VersionedTransaction,
 } from "@solana/web3.js";
 import {
-  KaminoMarket,
   PROGRAM_ID,
   getFlashLoanInstructions,
-  type KaminoReserve,
 } from "@kamino-finance/klend-sdk";
 import { formatAtomic, toSafeNumber } from "./amount.js";
 import { type BotConfig, SOL_DECIMALS, WSOL_MINT } from "./config.js";
@@ -23,23 +21,18 @@ import {
   createSyncNativeInstruction,
   deriveAssociatedTokenAddress,
 } from "./token.js";
+import { getJupiterSwapPlan } from "./jupiter.js";
 import {
-  getJupiterQuote,
-  getJupiterSwapPlan,
-  type JupiterSwapPlan,
-} from "./jupiter.js";
-import {
-  assertStakePoolEpochFresh,
   buildUpdateStakePoolBalanceInstruction,
   buildWithdrawSolInstruction,
-  estimateWithdrawSolLamports,
-  loadStakePool,
 } from "./stake-pool.js";
+import type { EligibleCandidate, ScannerRuntime } from "./scanner.js";
 
 export type FlashRedeemPlan = {
   transaction: VersionedTransaction;
   blockhash: string;
   lastValidBlockHeight: number;
+  strategyId: string;
   flashBorrowInstructionIndex: number;
   flashBorrowRaw: bigint;
   flashFeeRaw: bigint;
@@ -47,15 +40,15 @@ export type FlashRedeemPlan = {
   quoteOutRaw: bigint;
   quoteMinimumOutRaw: bigint;
   lstToBurnRaw: bigint;
+  lstDecimals: number;
   expectedWithdrawRaw: bigint;
-  expectedNetProfitBeforeNetworkRaw: bigint;
+  expectedNetBeforeNetworkRaw: bigint;
+  expectedNetAfterBudgetRaw: bigint;
   targetMinimumWithdrawRaw: bigint;
   instructions: TransactionInstruction[];
   routeLabels: string[];
-  wsolAta: PublicKey;
-  lstAta: PublicKey;
-  reserve: PublicKey;
-  stakePool: PublicKey;
+  reserve: string;
+  stakePool: string;
 };
 
 function assert(condition: unknown, message: string): asserts condition {
@@ -85,192 +78,54 @@ async function getLookupTables(
   });
 }
 
-function selectWsolReserve(
-  market: KaminoMarket,
-  config: BotConfig,
-): KaminoReserve {
-  const reserve = config.kaminoWsolReserve
-    ? market.getReserveByAddress(config.kaminoWsolReserve)
-    : market.getReserveByMint(WSOL_MINT);
-  if (!reserve) {
-    throw new Error(
-      config.kaminoWsolReserve
-        ? `Configured KAMINO_WSOL_RESERVE ${config.kaminoWsolReserve.toBase58()} is not in KAMINO_LENDING_MARKET`
-        : "Could not find a WSOL reserve in KAMINO_LENDING_MARKET; set KAMINO_WSOL_RESERVE explicitly",
-    );
-  }
-  if (!reserve.getLiquidityMint().equals(WSOL_MINT)) {
-    throw new Error(
-      `Configured Kamino reserve ${reserve.address.toBase58()} does not use the WSOL native mint`,
-    );
-  }
-  return reserve;
-}
-
-function calculateFlashFee(reserve: KaminoReserve, borrowRaw: bigint): bigint {
-  const fees = reserve.calculateFlashLoanFees(
-    new Decimal(borrowRaw.toString()),
-    0,
-    false,
-  );
-  // The SDK exposes token amount as Decimal; ceil protects the source ATA from a
-  // one-lamport shortfall if the protocol fee has fractional atomic units.
-  return BigInt(fees.protocolFees.ceil().toFixed(0));
-}
-
-function assertQuoteMatchesFlow(
-  swap: JupiterSwapPlan,
-  config: BotConfig,
-): { quoteOutRaw: bigint; quoteMinimumOutRaw: bigint } {
-  const { quote } = swap;
-  assert(
-    quote.inputMint === WSOL_MINT.toBase58(),
-    "Jupiter quote input mint is not WSOL",
-  );
-  assert(
-    quote.outputMint === config.lstMint.toBase58(),
-    "Jupiter quote output mint is not the configured marginfi LST",
-  );
-  assert(
-    quote.inAmount === config.flashBorrowRaw.toString(),
-    "Jupiter changed the exact WSOL input amount",
-  );
-
-  const quoteOutRaw = BigInt(quote.outAmount);
-  const quoteMinimumOutRaw = BigInt(quote.otherAmountThreshold);
-  assert(
-    quoteMinimumOutRaw >= config.minLstOutRaw,
-    `Jupiter's slippage-protected LST output ${formatAtomic(quoteMinimumOutRaw, SOL_DECIMALS)} is below MIN_LST_OUT ${formatAtomic(config.minLstOutRaw, SOL_DECIMALS)}`,
-  );
-  assert(
-    quoteMinimumOutRaw >= config.lstToBurnRaw,
-    "Jupiter's minimum output does not cover the LST amount that will be burned by WithdrawSol",
-  );
-  return { quoteOutRaw, quoteMinimumOutRaw };
-}
-
-function assertPoolAndProfit(args: {
-  poolMint: PublicKey;
-  estimatedWithdrawRaw: bigint;
-  reserveLamports: bigint;
-  config: BotConfig;
-  repaymentRaw: bigint;
-}): bigint {
-  const {
-    poolMint,
-    estimatedWithdrawRaw,
-    reserveLamports,
-    config,
-    repaymentRaw,
-  } = args;
-  if (!poolMint.equals(config.lstMint)) {
-    throw new Error(
-      `STAKE_POOL_ADDRESS pool mint ${poolMint.toBase58()} does not match LST_MINT ${config.lstMint.toBase58()}`,
-    );
-  }
-  const targetMinimumWithdrawRaw = [
-    config.minWithdrawSolRaw,
-    repaymentRaw + config.minNetProfitRaw + config.maxTxCostRaw,
-  ].reduce((maximum, value) => (value > maximum ? value : maximum), 0n);
-
-  assert(
-    estimatedWithdrawRaw >= targetMinimumWithdrawRaw,
-    `Estimated WithdrawSol output ${formatAtomic(estimatedWithdrawRaw, SOL_DECIMALS)} SOL is below required ${formatAtomic(targetMinimumWithdrawRaw, SOL_DECIMALS)} SOL`,
-  );
-  assert(
-    reserveLamports >= estimatedWithdrawRaw,
-    `Stake pool reserve has only ${formatAtomic(reserveLamports, SOL_DECIMALS)} SOL; it cannot fund the expected instant withdrawal`,
-  );
-  return targetMinimumWithdrawRaw;
-}
-
 /**
- * Build one atomic V0 transaction. The important ordering is:
- * setup → flash borrow → Jupiter swap → UpdateStakePoolBalance → WithdrawSol
- * → wrap exact Kamino repayment → flash repay.
+ * Builds the exact top-ranked scanner candidate. The candidate burns Jupiter's
+ * slippage-protected LST minimum, so its economic estimate is conservative.
  */
 export async function buildFlashRedeemPlan(args: {
   connection: Connection;
   wallet: Keypair;
   config: BotConfig;
+  runtime: ScannerRuntime;
+  candidate: EligibleCandidate;
 }): Promise<FlashRedeemPlan> {
-  const { connection, wallet, config } = args;
+  const { connection, wallet, config, runtime, candidate } = args;
   const walletAddress = wallet.publicKey;
+  const { pool, strategy } = candidate;
 
-  const [walletLamports, market, pool] = await Promise.all([
-    connection.getBalance(walletAddress, "processed"),
-    KaminoMarket.load(connection, config.kaminoLendingMarket, 400, PROGRAM_ID),
-    loadStakePool(connection, config.stakePool),
-  ]);
   assert(
-    BigInt(walletLamports) >= config.minGasBalanceRaw,
-    `Wallet needs at least ${formatAtomic(config.minGasBalanceRaw, SOL_DECIMALS)} SOL for ATA rent and transaction fees`,
-  );
-  if (!market)
-    throw new Error(
-      `Kamino lending market ${config.kaminoLendingMarket.toBase58()} was not found`,
-    );
-
-  const reserve = selectWsolReserve(market, config);
-  const availableLiquidity = BigInt(
-    reserve.getLiquidityAvailableAmount().floor().toFixed(0),
+    candidate.quote.inputMint === WSOL_MINT.toBase58() &&
+      candidate.quote.outputMint === strategy.lstMint.toBase58(),
+    "Scanner candidate has mismatched Jupiter mints",
   );
   assert(
-    availableLiquidity >= config.flashBorrowRaw,
-    `Kamino WSOL reserve has only ${formatAtomic(availableLiquidity, SOL_DECIMALS)} WSOL available`,
+    candidate.quote.inAmount === candidate.borrowRaw.toString(),
+    "Scanner candidate has mismatched Jupiter input",
   );
-
-  assertStakePoolEpochFresh(pool);
-  const expectedWithdrawRaw = estimateWithdrawSolLamports(
-    pool.state,
-    config.lstToBurnRaw,
-  );
-  const flashFeeRaw = calculateFlashFee(reserve, config.flashBorrowRaw);
   assert(
-    flashFeeRaw <= config.maxFlashFeeRaw,
-    `On-chain Kamino flash fee ${formatAtomic(flashFeeRaw, SOL_DECIMALS)} SOL exceeds MAX_FLASH_FEE_SOL`,
+    candidate.quoteMinimumOutRaw === candidate.lstToBurnRaw,
+    "Scanner candidate must burn its protected Jupiter minimum",
   );
-  const flashRepaymentRaw = config.flashBorrowRaw + flashFeeRaw;
-  const targetMinimumWithdrawRaw = assertPoolAndProfit({
-    poolMint: pool.state.poolMint,
-    estimatedWithdrawRaw: expectedWithdrawRaw,
-    reserveLamports: pool.reserveLamports,
-    config,
-    repaymentRaw: flashRepaymentRaw,
-  });
 
-  const wsolTokenProgram = reserve.getLiquidityTokenProgram();
+  const wsolTokenProgram = runtime.reserve.getLiquidityTokenProgram();
   const wsolAta = deriveAssociatedTokenAddress(
     WSOL_MINT,
     walletAddress,
     wsolTokenProgram,
   );
   const lstAta = deriveAssociatedTokenAddress(
-    config.lstMint,
+    strategy.lstMint,
     walletAddress,
     pool.state.tokenProgramId,
   );
-
-  const quote = await getJupiterQuote(
-    config,
-    WSOL_MINT,
-    config.lstMint,
-    config.flashBorrowRaw,
-  );
   const swap = await getJupiterSwapPlan({
     config,
-    quote,
+    quote: candidate.quote,
     wallet: walletAddress,
     destinationLstAccount: lstAta,
     kaminoProgram: PROGRAM_ID,
   });
-  const { quoteOutRaw, quoteMinimumOutRaw } = assertQuoteMatchesFlow(
-    swap,
-    config,
-  );
 
-  // Compute budget must occur before all program instructions. Its presence means
-  // the Kamino borrow is not instruction 0; the exact index is supplied below.
   const preInstructions: TransactionInstruction[] = [
     ComputeBudgetProgram.setComputeUnitLimit({
       units: config.computeUnitLimit,
@@ -289,7 +144,7 @@ export async function buildFlashRedeemPlan(args: {
       payer: walletAddress,
       associatedToken: lstAta,
       owner: walletAddress,
-      mint: config.lstMint,
+      mint: strategy.lstMint,
       tokenProgram: pool.state.tokenProgramId,
     }),
   ];
@@ -297,41 +152,38 @@ export async function buildFlashRedeemPlan(args: {
   const { flashBorrowIxn, flashRepayIxn } = getFlashLoanInstructions({
     borrowIxnIndex: flashBorrowInstructionIndex,
     walletPublicKey: walletAddress,
-    lendingMarketAuthority: market.getLendingMarketAuthority(),
-    lendingMarketAddress: market.getAddress(),
-    reserve,
-    amountLamports: new Decimal(config.flashBorrowRaw.toString()),
+    lendingMarketAuthority: runtime.market.getLendingMarketAuthority(),
+    lendingMarketAddress: runtime.market.getAddress(),
+    reserve: runtime.reserve,
+    amountLamports: new Decimal(candidate.borrowRaw.toString()),
     destinationAta: wsolAta,
-    // klend's legacy web3 interface uses the lending-program ID as the
-    // no-referrer sentinel (not the system-program/default key).
-    referrerAccount: market.programId,
-    referrerTokenState: market.programId,
+    // klend's legacy web3 interface uses the lending-program ID as the no-referrer sentinel.
+    referrerAccount: runtime.market.programId,
+    referrerTokenState: runtime.market.programId,
     programId: PROGRAM_ID,
   });
-
-  const updateStakePoolBalance = buildUpdateStakePoolBalanceInstruction(pool);
-  const withdrawSol = buildWithdrawSolInstruction({
-    pool,
-    wallet: walletAddress,
-    sourceLstAccount: lstAta,
-    poolTokens: config.lstToBurnRaw,
-  });
-  const wrapRepayment = SystemProgram.transfer({
-    fromPubkey: walletAddress,
-    toPubkey: wsolAta,
-    lamports: toSafeNumber(flashRepaymentRaw, "Kamino repayment"),
-  });
-  const syncWrappedSol = createSyncNativeInstruction(wsolAta, wsolTokenProgram);
 
   const instructions = [
     ...preInstructions,
     flashBorrowIxn,
     ...swap.setupInstructions,
     ...swap.swapInstructions,
-    updateStakePoolBalance,
-    withdrawSol,
-    wrapRepayment,
-    syncWrappedSol,
+    buildUpdateStakePoolBalanceInstruction(pool),
+    buildWithdrawSolInstruction({
+      pool,
+      wallet: walletAddress,
+      sourceLstAccount: lstAta,
+      poolTokens: candidate.lstToBurnRaw,
+    }),
+    SystemProgram.transfer({
+      fromPubkey: walletAddress,
+      toPubkey: wsolAta,
+      lamports: toSafeNumber(
+        candidate.economics.flashRepaymentRaw,
+        "Kamino repayment",
+      ),
+    }),
+    createSyncNativeInstruction(wsolAta, wsolTokenProgram),
     flashRepayIxn,
   ];
   assert(
@@ -355,22 +207,24 @@ export async function buildFlashRedeemPlan(args: {
     transaction,
     blockhash: latestBlockhash.blockhash,
     lastValidBlockHeight: latestBlockhash.lastValidBlockHeight,
+    strategyId: strategy.id,
     flashBorrowInstructionIndex,
-    flashBorrowRaw: config.flashBorrowRaw,
-    flashFeeRaw,
-    flashRepaymentRaw,
-    quoteOutRaw,
-    quoteMinimumOutRaw,
-    lstToBurnRaw: config.lstToBurnRaw,
-    expectedWithdrawRaw,
-    expectedNetProfitBeforeNetworkRaw: expectedWithdrawRaw - flashRepaymentRaw,
-    targetMinimumWithdrawRaw,
+    flashBorrowRaw: candidate.borrowRaw,
+    flashFeeRaw: candidate.economics.flashFeeRaw,
+    flashRepaymentRaw: candidate.economics.flashRepaymentRaw,
+    quoteOutRaw: candidate.quoteOutRaw,
+    quoteMinimumOutRaw: candidate.quoteMinimumOutRaw,
+    lstToBurnRaw: candidate.lstToBurnRaw,
+    lstDecimals: pool.poolTokenDecimals,
+    expectedWithdrawRaw: candidate.expectedWithdrawRaw,
+    expectedNetBeforeNetworkRaw:
+      candidate.economics.expectedNetBeforeNetworkRaw,
+    expectedNetAfterBudgetRaw: candidate.economics.expectedNetAfterBudgetRaw,
+    targetMinimumWithdrawRaw: candidate.economics.minimumWithdrawRaw,
     instructions,
     routeLabels: swap.routeLabels,
-    wsolAta,
-    lstAta,
-    reserve: reserve.address,
-    stakePool: pool.address,
+    reserve: runtime.reserve.address.toBase58(),
+    stakePool: pool.address.toBase58(),
   };
 }
 
@@ -402,7 +256,7 @@ export async function sendPlan(
   const signature = await connection.sendRawTransaction(
     plan.transaction.serialize(),
     {
-      skipPreflight: true, // Full preflight is performed by simulatePlan immediately before this call.
+      skipPreflight: true,
       maxRetries: 0,
     },
   );
@@ -426,17 +280,19 @@ export function planSummary(
   plan: FlashRedeemPlan,
 ): Record<string, string | number | string[]> {
   return {
-    "Kamino WSOL reserve": plan.reserve.toBase58(),
-    "Marginfi LST stake pool": plan.stakePool.toBase58(),
+    Strategy: plan.strategyId,
+    "Kamino WSOL reserve": plan.reserve,
+    "LST stake pool": plan.stakePool,
     "Flash borrow": `${formatAtomic(plan.flashBorrowRaw, SOL_DECIMALS)} WSOL`,
     "Kamino flash fee (on-chain)": `${formatAtomic(plan.flashFeeRaw, SOL_DECIMALS)} WSOL`,
     "Flash repayment": `${formatAtomic(plan.flashRepaymentRaw, SOL_DECIMALS)} WSOL`,
-    "Jupiter quote output": `${formatAtomic(plan.quoteOutRaw, SOL_DECIMALS)} LST`,
-    "Jupiter minimum output": `${formatAtomic(plan.quoteMinimumOutRaw, SOL_DECIMALS)} LST`,
-    "LST burned": `${formatAtomic(plan.lstToBurnRaw, SOL_DECIMALS)} LST`,
+    "Jupiter quote output": `${formatAtomic(plan.quoteOutRaw, plan.lstDecimals)} LST`,
+    "Jupiter protected output": `${formatAtomic(plan.quoteMinimumOutRaw, plan.lstDecimals)} LST`,
+    "LST burned": `${formatAtomic(plan.lstToBurnRaw, plan.lstDecimals)} LST`,
     "WithdrawSol expected": `${formatAtomic(plan.expectedWithdrawRaw, SOL_DECIMALS)} SOL`,
-    "Minimum withdrawal gate": `${formatAtomic(plan.targetMinimumWithdrawRaw, SOL_DECIMALS)} SOL`,
-    "Expected net before network": `${formatAtomic(plan.expectedNetProfitBeforeNetworkRaw, SOL_DECIMALS)} SOL`,
+    "Dynamic repayment/profit gate": `${formatAtomic(plan.targetMinimumWithdrawRaw, SOL_DECIMALS)} SOL`,
+    "Expected net before network": `${formatAtomic(plan.expectedNetBeforeNetworkRaw, SOL_DECIMALS)} SOL`,
+    "Expected net after fee budget": `${formatAtomic(plan.expectedNetAfterBudgetRaw, SOL_DECIMALS)} SOL`,
     "Kamino borrow instruction index": plan.flashBorrowInstructionIndex,
     "Jupiter route": plan.routeLabels,
     "Instruction count": plan.instructions.length,

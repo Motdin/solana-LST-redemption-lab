@@ -1,0 +1,11 @@
+{
+  "strategies": [
+    {
+      "id": "marginfi-lst-redemption",
+      "enabled": true,
+      "lstMint": "LSTxxxnJzKDFSLr4dUkPcmCf5VyryEqzPLz5j4bpxFp",
+      "stakePool": "DqhH94PjkZsjAqEze2BEkWhFQJ6EyU6MdtMphMgnXqeK",
+      "borrowAmountsSol": ["0.25", "0.5", "1", "2.5", "5", "10"]
+    }
+  ]
+}

@@ -1,140 +1,171 @@
-# Marginfi LST ↔ Kamino WSOL atomic flash bot
+# Kamino WSOL → LST redemption arbitrage scanner
 
-Bot TypeScript ini menyusun **satu transaksi Solana v0 atomik** untuk flow yang diminta:
+Scanner TypeScript untuk mencari dan mengeksekusi peluang atomik di Solana:
 
-1. **Flash borrow** — Kamino reserve → searcher: **2.5 WSOL**
-2. **Buy swap** — searcher → DEX route: **2.5 WSOL**
-3. **Receive swap** — DEX route → searcher: minimal **1.1133 LST**
-4. **Crank NAV** — SPL Stake Pool `UpdateStakePoolBalance` (tanpa transfer)
-5. **Unstake instan** — stake-pool reserve → searcher: burn **1.1133 LST**, target minimal **3.3119 SOL**
-6. **Wrap repayment** — searcher wallet → WSOL ATA, lalu `SyncNative`
-7. **Flash repay** — searcher → Kamino reserve: principal + fee on-chain (contoh **2.500025 WSOL** bila fee 0.001%)
+```text
+Kamino flash borrow WSOL
+→ Jupiter: WSOL → LST
+→ SPL Stake Pool: UpdateStakePoolBalance
+→ WithdrawSol: burn LST → native SOL
+→ wrap exact repayment to WSOL
+→ Kamino flash repay
+```
 
-`LST` default adalah mint mrgnFi (`LSTxxx…bpxFp`) dan stake-pool default adalah `DqhH…XqeK`. Keduanya **tetap diverifikasi dari state on-chain** sebelum transaksi dibuat.
+Project ini dimulai dengan mrgnFi LST (`LSTxxx…bpxFp`) dan mendukung **whitelist beberapa LST / SPL stake pool** melalui `strategies.json`. Ia bukan scanner token bebas; hanya pool yang Anda verifikasi sendiri akan disentuh.
 
 > [!WARNING]
-> Ini adalah perangkat eksekusi DeFi berisiko tinggi, bukan jaminan profit. Gunakan **wallet hot terpisah** yang hanya menyimpan SOL untuk gas/rent. Jangan pernah menyimpan private key pada `.env`, repository, atau log. Flash loan memang atomik—jika repayment gagal, semua state strategy di transaksi juga rollback—tetapi network fee, priority fee, stale quote, account rent, API/routing, dan risiko kontrak tetap ada.
+> Ini adalah software DeFi berisiko tinggi dan bukan jaminan profit. Pakai hot wallet terpisah dengan SOL terbatas untuk fee/rent. Jangan pernah membagikan seed phrase atau isi file keypair JSON. Semua execution mainnet adalah tanggung jawab operator.
 
-## Proteksi yang diimplementasikan
+## Empat tahap yang tersedia
 
-- **Tidak ada pengiriman default.** `EXECUTION_ENABLED=false` secara default; untuk send diperlukan **dua** gate: env `EXECUTION_ENABLED=true` dan flag `--yes`.
-- Menggunakan amount integer `bigint`; tidak ada pembulatan `number` untuk token/SOL.
-- Mengambil **fee flash loan dari reserve Kamino on-chain**, bukan mengasumsikan `0.000025`. `MAX_FLASH_FEE_SOL` menolak fee yang lebih tinggi.
-- Quote Jupiter wajib `ExactIn`, input harus tepat 2.5 WSOL, dan `otherAmountThreshold` harus cukup untuk LST yang dibakar.
-- Mengecek mint stake pool, reserve instant-withdraw, fresh epoch, likuiditas Kamino, saldo gas, fee pool, profit floor, dan minimum withdrawal sebelum build.
-- `UpdateStakePoolBalance` dan `WithdrawSol` berada **di tengah transaksi yang sama**. Validator-list stake pool wajib sudah di-crank untuk epoch saat ini; bot menolak state stale daripada mencoba flow yang pasti gagal.
-- SOL hasil withdraw diterima wallet lalu hanya sejumlah **repayment tepat** yang ditransfer ke WSOL ATA dan `SyncNative`. Sisa SOL tetap sebagai kandidat profit.
-- Jupiter menghasilkan instruction dari API, jadi bot memasang validasi signer dan menolak instruction Jupiter yang mencoba memasukkan System/Stake/Compute Budget/Kamino/Stake Pool program ke route. Gunakan `STRICT_JUPITER_VALIDATION=true` kecuali Anda memahami konsekuensinya.
-- Selalu jalankan `simulate` sebelum `execute`; command execute melakukan simulasi lagi langsung sebelum send.
+1. **Dynamic scanner, watch-only** — quote beberapa ukuran flash loan untuk mrgnFi LST dan menghitung output redemption terbaru.
+2. **Whitelist multi-pool** — tambahkan LST / SPL stake pool terverifikasi ke `strategies.json`.
+3. **Simulasi kandidat terbaik** — hanya kandidat dengan `net >= MIN_NET_PROFIT_SOL` yang dibangun dan disimulasikan.
+4. **Execution bergated** — send hanya ketika kandidat terbaik lulus scanner, build, simulation, `EXECUTION_ENABLED=true`, dan flag `--yes`.
 
-## Persiapan
+Tidak ada `MIN_LST_OUT`, `LST_TO_BURN`, atau `MIN_WITHDRAW_SOL` statis. Untuk setiap kandidat scanner memakai **Jupiter `otherAmountThreshold`** sebagai jumlah LST yang dibakar, lalu menghitung kembali NAV/withdraw fee stake pool. Gate dinamis adalah:
+
+```text
+minimum WithdrawSol output =
+  flash principal
+  + flash fee Kamino aktual
+  + MAX_TX_COST_SOL
+  + MIN_NET_PROFIT_SOL
+```
+
+Dengan begitu nominal yang tidak lagi masuk akal di state terbaru—misalnya 1.1133 LST yang hanya dapat diredeem menjadi 1.718 SOL—akan ditolak tanpa transaksi dikirim.
+
+## Proteksi utama
+
+- Integer token/SOL menggunakan `bigint`, tanpa pembulatan `number`.
+- Kamino reserve, liquidity, dan flash fee dibaca ulang pada setiap scan.
+- Quote Jupiter harus exact-in WSOL → mint LST yang ada di whitelist.
+- Candidate membakar output LST **minimum yang terlindungi slippage**, bukan quote optimistis.
+- Memeriksa mint pool, freshness epoch, withdrawal authority, instant reserve liquidity, flash fee relative (`MAX_FLASH_FEE_BPS`), dan profit setelah budget biaya.
+- Memakai `UpdateStakePoolBalance` sebelum `WithdrawSol` di transaksi atomik.
+- Sol hasil redeem diterima wallet, lalu hanya nominal repayment aktual yang di-wrap sebagai WSOL untuk Kamino; sisanya adalah kandidat profit.
+- Menolak Jupiter instruction dengan signer tambahan atau System/Stake/ComputeBudget/Kamino/Stake Pool program bila `STRICT_JUPITER_VALIDATION=true`.
+- `watch` default observe-only. Execution butuh dua gate eksplisit.
+
+## Install dan konfigurasi
 
 ```bash
 npm install
 cp .env.example .env
 ```
 
-Lengkapi minimal berikut di `.env`:
+Di Windows PowerShell:
 
-- `RPC_URL`: RPC mainnet yang andal (untuk production gunakan RPC privat/staked).
-- `KEYPAIR_PATH`: path ke keypair JSON Solana CLI pada wallet hot.
-- `KAMINO_LENDING_MARKET`: market Kamino yang benar-benar berisi reserve WSOL. Nilai ini **sengaja tidak diberi default** agar tidak salah market.
-- `KAMINO_WSOL_RESERVE` bersifat opsional. Jika tidak diisi, bot mencari reserve dengan mint WSOL di dalam market tersebut. Setelah market benar, cari dan pin alamat reserve dengan command berikut—command ini tidak membutuhkan `KEYPAIR_PATH` atau private key:
+```powershell
+Copy-Item .env.example .env
+```
 
-  ```bash
-  npm run inspect:reserve
-  ```
+Isi `.env` minimal:
 
-  Salin output `KAMINO_WSOL_RESERVE=...` ke `.env` untuk mengunci strategi ke reserve yang telah diverifikasi.
+```env
+RPC_URL=https://RPC_MAINNET_ANDA
+KEYPAIR_PATH=C:/Users/Anda/.config/solana/flash-bot.json
+KAMINO_LENDING_MARKET=7u3HeHxYDLhnCoErrtycNokbQYbWGzLs6JSDqGAv5PfF
+KAMINO_WSOL_RESERVE=d4A2prbA2whesmvHaL88BH6Ewn5N4bTSU2Ze8P6Bc4Q
+EXECUTION_ENABLED=false
+```
 
-Alamat default mrgnFi LST dan stake pool boleh dibiarkan. Jangan menganggap nilai default amount masih profitable hari ini—nilai tersebut adalah flow yang diminta, sedangkan quote, fee, NAV, dan reserve dibaca ulang setiap run.
+`KAMINO_WSOL_RESERVE` adalah optional safety pin. Untuk memverifikasi reserve dari market tanpa private key:
 
-### Membuat hot wallet tanpa Solana CLI
+```bash
+npm run inspect:reserve
+```
 
-Jika Solana CLI belum terpasang, Node.js dependency project sudah dapat membuat keypair standard tanpa mengirim secret ke jaringan:
+## Whitelist strategi
+
+`strategies.json` adalah file publik tanpa secret. Default hanya berisi mrgnFi LST:
+
+```json
+{
+  "strategies": [
+    {
+      "id": "marginfi-lst-redemption",
+      "enabled": true,
+      "lstMint": "LSTxxxnJzKDFSLr4dUkPcmCf5VyryEqzPLz5j4bpxFp",
+      "stakePool": "DqhH94PjkZsjAqEze2BEkWhFQJ6EyU6MdtMphMgnXqeK",
+      "borrowAmountsSol": ["0.25", "0.5", "1", "2.5", "5", "10"]
+    }
+  ]
+}
+```
+
+Untuk tahap 2, tambahkan object baru ke array `strategies`. Setiap entry harus mempunyai:
+
+- `id` unik;
+- `lstMint` yang benar;
+- `stakePool` SPL Stake Pool yang benar;
+- `borrowAmountsSol` sebagai string decimal;
+- `enabled: true` hanya setelah pool/mint diverifikasi.
+
+Scanner membatasi maksimal 24 strategi dan 64 quote per putaran untuk menghindari request tak terkendali. Jangan memasukkan mint atau pool yang tidak Anda audit.
+
+## Hot wallet tanpa Solana CLI
+
+Project dapat membuat keypair format Solana CLI dari Node.js lokal:
 
 ```bash
 npm run wallet:create
 ```
 
-Secara default file dibuat di `~/.config/solana/flash-bot.json`; gunakan `npm run wallet:create -- --output <path>` untuk memilih lokasi lain. Command menolak overwrite file yang sudah ada dan hanya menampilkan public address. Masukkan path yang dicetak ke `KEYPAIR_PATH`, lalu transfer SOL kecil untuk gas. Jangan simpan keypair di folder repo atau membagikan isi file JSON-nya.
+Default path adalah `~/.config/solana/flash-bot.json`; pilih path lain dengan:
 
-### Mengirim profit SOL tanpa Solana CLI
+```bash
+npm run wallet:create -- --output <path>
+```
 
-Profit bersih tetap berada di hot wallet bot setelah transaksi sukses. Untuk mengirim SOL dari keypair lokal itu ke wallet penerima tanpa mengungkapkan private key, gunakan:
+Command menolak overwrite file yang sudah ada dan hanya mencetak public address. Isi `KEYPAIR_PATH` dengan path itu. Kirim SOL kecil—default bot memerlukan minimal `0.02 SOL` sebagai rent/fee reserve. Jangan simpan keypair dalam folder repo atau membagikan isi JSON-nya.
+
+## Command operasional
+
+```bash
+# Cek type dan test
+npm run typecheck
+npm test
+
+# Tahap 1–2: tampilkan seluruh candidate whitelist; tidak sign/send
+npm run scan
+
+# Build candidate paling menguntungkan; tidak simulate/send
+npm run plan
+
+# Tahap 3: build + simulate top candidate; tidak send
+npm run simulate
+
+# Monitor berulang, observe-only
+npm run watch
+
+# Tahap 4: hanya setelah setup matang dan EXECUTION_ENABLED=true
+npm run execute -- --yes
+# atau monitor+execute top candidate yang lulus
+npm run watch -- --execute --yes
+```
+
+`scan` dapat menampilkan banyak `rejected` candidate. Itu adalah hasil normal ketika redemption tidak menutup repayment atau quote tidak tersedia. Candidate `ELIGIBLE` baru berarti layak dibangun; masih harus lulus simulation sebelum send.
+
+## Mengirim profit SOL
+
+Profit aktual tetap berada pada hot wallet bot. Untuk transfer ke wallet penerima tanpa mengungkapkan keypair:
 
 ```bash
 npm run wallet:send-sol -- --to <PUBLIC_ADDRESS_PENERIMA> --amount 0.1 --yes
 ```
 
-Command meminta `RPC_URL` dan `KEYPAIR_PATH` dari `.env`, mengecek saldo terlebih dahulu, dan secara default menyisakan `0.02 SOL` ditambah buffer fee `0.0001 SOL` di hot wallet. Ubah saldo yang disisakan dengan `--keep 0.05` atau `PAYOUT_KEEP_SOL=0.05`. Periksa address penerima dan nominal sebelum menambahkan `--yes`; transfer SOL yang telah confirmed tidak dapat dibatalkan.
+Command membaca `RPC_URL` dan `KEYPAIR_PATH`, memeriksa saldo, lalu secara default menyisakan `0.02 SOL` dan fee buffer `0.0001 SOL`. Tambahkan `--keep 0.05` untuk menyisakan lebih banyak SOL. Transfer yang confirmed tidak dapat dibatalkan—periksa public address dan amount sebelum memakai `--yes`.
 
-## Menjalankan
+## Batasan penting
 
-```bash
-# Cek type dan unit test lokal
-npm run typecheck
-npm test
+- Mainnet-only.
+- `WithdrawSol` memakai stake-pool reserve dan dapat gagal bila reserve tidak cukup, bahkan jika preview sebelumnya cukup; simulasi terbaru adalah validasi terakhir sebelum send.
+- SPL `WithdrawSol` versi standar pada SDK ini tidak membawa minimum-output parameter on-chain. Bot menggunakan quote minimum, estimasi konservatif, gate profit, dan full simulation; tetap ada risiko perubahan state antara simulation dan landing.
+- Quote profitable bukan jaminan transaction landing. Priority fee, account size, MEV, liquidity, dan state slot bisa berubah.
+- Jangan menonaktifkan strict validation atau menaikkan slippage/fee tanpa memahami konsekuensinya.
 
-# Build quote + transaksi saja; tidak simulasi, tidak sign/send ke jaringan
-npm run plan
-
-# Build dan simulasi; tidak send
-npm run simulate
-
-# Send sekali — hanya setelah simulation dipahami dan EXECUTION_ENABLED=true
-npm run execute -- --yes
-
-# Monitor quote tiap POLL_MS, hanya observasi
-npm run watch
-
-# Monitor dan execute kandidat yang lulus semua gate
-npm run watch -- --execute --yes
-```
-
-Output `plan` menampilkan fee flash aktual, minimum output Jupiter, estimasi `WithdrawSol`, batas minimum withdrawal, dan net sebelum biaya network. Jika salah satu preflight tidak memenuhi syarat, bot berhenti dan **tidak** membuat transaksi kirim.
-
-## Catatan flow penting
-
-### Mengapa ada `SyncNative`?
-
-Kamino meminjamkan **WSOL**, sedangkan `WithdrawSol` dari SPL stake pool membayar **native SOL** ke system account wallet. Repayment WSOL mustahil tanpa langkah transfer SOL → WSOL ATA dan `SyncNative`. Langkah ini tidak mengubah ekonomi flow: hanya wrap sebesar `principal + fee` aktual sebelum `flashRepayReserveLiquidity`.
-
-### Mengapa borrow instruction tidak index 0?
-
-Compute budget dan idempotent ATA setup diletakkan lebih dulu agar transaksi dapat berjalan pada wallet baru. Kamino repayment perlu menunjuk index borrow yang tepat; bot menghitung index aktual (biasanya `4`) dan memasukkannya ke instruction repay. Urutan ekonomi tetap borrow → swap → crank → withdraw → repay.
-
-### Crank stake pool
-
-`UpdateStakePoolBalance` hanya refresh total NAV; ia bergantung pada validator list yang sudah updated pada epoch aktif. `UpdateValidatorListBalance` tidak dimasukkan ke flash transaction karena update tersebut memiliki batasan komposisi keamanan pada SPL stake pool. Bila preflight menyebut pool stale, jalankan crank permissionless validator-list terlebih dahulu dalam transaksi terpisah, lalu ulangi simulasi.
-
-### Instant withdrawal bukan selalu tersedia
-
-`WithdrawSol` memakai reserve stake pool. Ia dapat gagal jika reserve tidak memiliki SOL likuid yang cukup atau pool menambahkan authority/aturan baru. Bot mengecek reserve dan authority yang terlihat on-chain, namun simulasi pada slot terbaru tetap adalah keputusan akhir sebelum send.
-
-## Konfigurasi strategi
-
-| Variabel                           |   Default | Makna                                                                          |
-| ---------------------------------- | --------: | ------------------------------------------------------------------------------ |
-| `FLASH_BORROW_SOL`                 |     `2.5` | Input WSOL exact untuk flash loan dan Jupiter swap                             |
-| `MIN_LST_OUT`                      |  `1.1133` | Minimum Jupiter output setelah slippage                                        |
-| `LST_TO_BURN`                      |  `1.1133` | LST exact yang dibakar dengan `WithdrawSol`                                    |
-| `MIN_WITHDRAW_SOL`                 |  `3.3119` | Target minimum penerimaan SOL dari stake pool                                  |
-| `MAX_FLASH_FEE_SOL`                | `0.00003` | Batas maksimum fee Kamino yang diterima                                        |
-| `MIN_NET_PROFIT_SOL`               |    `0.01` | Profit minimum sebelum biaya network                                           |
-| `MAX_TX_COST_SOL`                  |   `0.005` | Budget network fee yang turut dipakai gate profit                              |
-| `ONLY_DIRECT_ROUTES`               |    `true` | Batasi Jupiter ke direct route/pool; set `false` hanya bila memahami multi-hop |
-| `COMPUTE_UNIT_LIMIT`               | `1200000` | Compute budget transaksi                                                       |
-| `COMPUTE_UNIT_PRICE_MICROLAMPORTS` |   `10000` | Priority fee per CU                                                            |
-
-## Batasan desain
-
-- Mainnet-only; mrgnFi LST stake pool default bukan deployment devnet.
-- Jupiter route dapat berubah, jadi API call dilakukan ulang untuk setiap plan; transaksi lama tidak didaur ulang.
-- `WithdrawSol` standar SPL stake pool tidak menerima parameter output minimum pada SDK versi ini. Karena itu bot menggunakan beberapa guard (NAV preview konservatif, minimum profit/withdraw gate, quote threshold) dan mewajibkan simulation sebelum send. Tidak ada guard off-chain yang menggantikan audit transaksi/contract sendiri.
-- Jangan menonaktifkan strict validation atau menaikkan slippage/priority fee tanpa memahami instruksi V0 dan account lookup table yang dipakai.
-
-## Referensi protokol
+## Referensi
 
 - [Kamino flash-loan docs](https://kamino.com/docs/build/borrow/multiply/flash-loans)
 - [Jupiter swap-instructions API](https://dev.jup.ag/docs/swap/build-swap-transaction)

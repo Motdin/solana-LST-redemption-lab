@@ -13,24 +13,20 @@ export const MARGINFI_STAKE_POOL = new PublicKey(
   "DqhH94PjkZsjAqEze2BEkWhFQJ6EyU6MdtMphMgnXqeK",
 );
 
+/** Global execution and pricing controls shared by every whitelisted strategy. */
 export type BotConfig = {
   rpcUrl: string;
   keypairPath: string;
   kaminoLendingMarket: PublicKey;
   kaminoWsolReserve?: PublicKey;
-  stakePool: PublicKey;
-  lstMint: PublicKey;
+  strategiesFile: string;
   jupiterApiBase: string;
   jupiterApiKey?: string;
   slippageBps: number;
   onlyDirectRoutes: boolean;
   maxQuoteAccounts?: number;
   strictJupiterValidation: boolean;
-  flashBorrowRaw: bigint;
-  minLstOutRaw: bigint;
-  lstToBurnRaw: bigint;
-  minWithdrawSolRaw: bigint;
-  maxFlashFeeRaw: bigint;
+  maxFlashFeeBps: number;
   minNetProfitRaw: bigint;
   maxTxCostRaw: bigint;
   minGasBalanceRaw: bigint;
@@ -42,9 +38,7 @@ export type BotConfig = {
 
 function required(name: string): string {
   const value = process.env[name]?.trim();
-  if (!value) {
-    throw new Error(`Missing required environment variable ${name}`);
-  }
+  if (!value) throw new Error(`Missing required environment variable ${name}`);
   return value;
 }
 
@@ -72,7 +66,7 @@ function bool(name: string, fallback: boolean): boolean {
   throw new Error(`${name} must be true or false`);
 }
 
-function positiveInteger(name: string, fallback: number, min = 1): number {
+function nonNegativeInteger(name: string, fallback: number, min = 0): number {
   const source = optional(name) ?? String(fallback);
   if (!/^\d+$/.test(source)) throw new Error(`${name} must be an integer`);
   const value = Number(source);
@@ -80,6 +74,10 @@ function positiveInteger(name: string, fallback: number, min = 1): number {
     throw new Error(`${name} must be an integer ≥ ${min}`);
   }
   return value;
+}
+
+function positiveInteger(name: string, fallback: number, min = 1): number {
+  return nonNegativeInteger(name, fallback, min);
 }
 
 function amount(name: string, fallback: string): bigint {
@@ -99,27 +97,14 @@ function normalizeJupiterUrl(url: string): string {
 }
 
 /**
- * Reads only configuration, never a private key. The keypair file is loaded later,
- * so `plan` fails before any signing if settings are incomplete.
+ * Secrets remain in a local JSON keypair file; this parser only reads paths and
+ * public configuration. Candidate amounts and pool whitelist live in STRATEGIES_FILE.
  */
 export function loadConfig(): BotConfig {
   const network = optional("SOLANA_CLUSTER") ?? "mainnet-beta";
   if (network !== "mainnet-beta") {
     throw new Error(
-      "This strategy is pinned to mainnet-beta because the configured marginfi LST pool is mainnet-only",
-    );
-  }
-
-  const flashBorrowRaw = amount("FLASH_BORROW_SOL", "2.5");
-  const lstToBurnRaw = amount("LST_TO_BURN", "1.1133");
-  const minLstOutRaw = amount("MIN_LST_OUT", "1.1133");
-  if (
-    flashBorrowRaw === 0n ||
-    lstToBurnRaw === 0n ||
-    minLstOutRaw < lstToBurnRaw
-  ) {
-    throw new Error(
-      "FLASH_BORROW_SOL and LST_TO_BURN must be positive; MIN_LST_OUT must cover LST_TO_BURN",
+      "This scanner is pinned to mainnet-beta because its SPL stake-pool strategies are mainnet-only",
     );
   }
 
@@ -130,8 +115,7 @@ export function loadConfig(): BotConfig {
     kaminoWsolReserve: optional("KAMINO_WSOL_RESERVE")
       ? asPublicKey("KAMINO_WSOL_RESERVE")
       : undefined,
-    stakePool: asPublicKey("STAKE_POOL_ADDRESS", MARGINFI_STAKE_POOL),
-    lstMint: asPublicKey("LST_MINT", MARGINFI_LST_MINT),
+    strategiesFile: optional("STRATEGIES_FILE") ?? "./strategies.json",
     jupiterApiBase: normalizeJupiterUrl(
       optional("JUPITER_API_BASE") ?? "https://lite-api.jup.ag/swap/v1",
     ),
@@ -142,19 +126,14 @@ export function loadConfig(): BotConfig {
       ? positiveInteger("MAX_QUOTE_ACCOUNTS", 40, 8)
       : 40,
     strictJupiterValidation: bool("STRICT_JUPITER_VALIDATION", true),
-    flashBorrowRaw,
-    minLstOutRaw,
-    lstToBurnRaw,
-    minWithdrawSolRaw: amount("MIN_WITHDRAW_SOL", "3.3119"),
-    maxFlashFeeRaw: amount("MAX_FLASH_FEE_SOL", "0.00003"),
+    maxFlashFeeBps: nonNegativeInteger("MAX_FLASH_FEE_BPS", 1),
     minNetProfitRaw: amount("MIN_NET_PROFIT_SOL", "0.01"),
     maxTxCostRaw: amount("MAX_TX_COST_SOL", "0.005"),
     minGasBalanceRaw: amount("MIN_GAS_BALANCE_SOL", "0.02"),
     computeUnitLimit: positiveInteger("COMPUTE_UNIT_LIMIT", 1_200_000, 100_000),
-    computeUnitPriceMicroLamports: positiveInteger(
+    computeUnitPriceMicroLamports: nonNegativeInteger(
       "COMPUTE_UNIT_PRICE_MICROLAMPORTS",
       10_000,
-      0,
     ),
     pollMs: positiveInteger("POLL_MS", 5_000, 500),
     executionEnabled: bool("EXECUTION_ENABLED", false),
