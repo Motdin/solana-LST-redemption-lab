@@ -1,4 +1,4 @@
-# Kamino WSOL → LST redemption arbitrage scanner
+# Kamino flash-arbitrage scanners
 
 Scanner TypeScript untuk mencari dan mengeksekusi peluang atomik di Solana:
 
@@ -11,7 +11,19 @@ Kamino flash borrow WSOL
 → Kamino flash repay
 ```
 
-Project ini dimulai dengan mrgnFi LST (`LSTxxx…bpxFp`) dan mendukung **whitelist beberapa LST / SPL stake pool** melalui `strategies.json`. Ia bukan scanner token bebas; hanya pool yang Anda verifikasi sendiri akan disentuh.
+Project ini memiliki dua scanner terpisah:
+
+1. **LST redemption** — alur di atas untuk whitelist LST / SPL stake pool di `strategies.json`; dapat dibangun, disimulasikan, dan—hanya dengan gate eksplisit—dikirim.
+2. **Pair observer** — observasi quote siklus dua venue untuk `WSOL → USDC/USDT → WSOL` dari `pair-strategies.json`:
+
+```text
+Kamino reference: WSOL flash principal + fee
+→ Jupiter direct quote pada venue A: WSOL → stablecoin
+→ Jupiter direct quote pada venue B: stablecoin → WSOL
+→ nilai final minimum dibandingkan dengan repayment + budget
+```
+
+Pair observer **hanya mengambil quote dan membaca state Kamino**. Ia tidak memuat keypair, meminta swap instruction, membangun transaksi, melakukan simulation, sign, atau send. Ia bukan scanner token bebas; seluruh mint dan label DEX harus ada pada allowlist publik yang Anda verifikasi sendiri.
 
 > [!WARNING]
 > Ini adalah software DeFi berisiko tinggi dan bukan jaminan profit. Pakai hot wallet terpisah dengan SOL terbatas untuk fee/rent. Jangan pernah membagikan seed phrase atau isi file keypair JSON. Semua execution mainnet adalah tanggung jawab operator.
@@ -21,12 +33,13 @@ Project ini dimulai dengan mrgnFi LST (`LSTxxx…bpxFp`) dan mendukung **whiteli
 1. **Dynamic scanner, watch-only** — quote beberapa ukuran flash loan untuk mrgnFi LST dan menghitung output redemption terbaru.
 2. **Whitelist multi-pool** — tambahkan LST / SPL stake pool terverifikasi ke `strategies.json`.
 3. **Simulasi kandidat terbaik** — hanya kandidat dengan `net >= MIN_NET_PROFIT_SOL` yang dibangun dan disimulasikan.
-4. **Execution bergated** — send hanya ketika kandidat terbaik lulus scanner, build, simulation, `EXECUTION_ENABLED=true`, dan flag `--yes`.
+4. **Execution bergated** — send hanya ketika kandidat terbaik LST lulus scanner, build, simulation, `EXECUTION_ENABLED=true`, dan flag `--yes`.
+5. **DEX pair observer** — scan read-only `WSOL → USDC/USDT → WSOL` pada dua venue Jupiter yang disjoint. Tidak ada command execution untuk strategy ini.
 
-Tidak ada `MIN_LST_OUT`, `LST_TO_BURN`, atau `MIN_WITHDRAW_SOL` statis. Untuk setiap kandidat scanner memakai **Jupiter `otherAmountThreshold`** sebagai jumlah LST yang dibakar, lalu menghitung kembali NAV/withdraw fee stake pool. Gate dinamis adalah:
+Tidak ada `MIN_LST_OUT`, `LST_TO_BURN`, atau `MIN_WITHDRAW_SOL` statis. Scanner LST memakai **Jupiter `otherAmountThreshold`** sebagai jumlah LST yang dibakar, lalu menghitung kembali NAV/withdraw fee stake pool. Pair observer memakai threshold leg pertama sebagai input leg kedua dan hanya menilai threshold WSOL akhir. Keduanya memakai gate dinamis:
 
 ```text
-minimum WithdrawSol output =
+minimum protected final WSOL output =
   flash principal
   + flash fee Kamino aktual
   + MAX_TX_COST_SOL
@@ -70,6 +83,14 @@ KAMINO_WSOL_RESERVE=d4A2prbA2whesmvHaL88BH6Ewn5N4bTSU2Ze8P6Bc4Q
 EXECUTION_ENABLED=false
 ```
 
+Pair observer memakai file default `./pair-strategies.json`; ubah hanya jika Anda membutuhkan file allowlist terpisah:
+
+```env
+PAIR_STRATEGIES_FILE=./pair-strategies.json
+```
+
+`scan:pairs` dan `watch:pairs` hanya membutuhkan `RPC_URL`, market/reserve Kamino, serta konfigurasi Jupiter. Keduanya tidak membaca `KEYPAIR_PATH`; variabel tersebut tetap diperlukan untuk command LST `scan`, `plan`, `simulate`, `execute`, dan `watch`.
+
 `KAMINO_WSOL_RESERVE` adalah optional safety pin. Untuk memverifikasi reserve dari market tanpa private key:
 
 ```bash
@@ -106,6 +127,27 @@ Untuk tahap 2, tambahkan object baru ke array `strategies`. Setiap entry harus m
 
 Scanner membatasi maksimal 24 strategi dan 64 quote per putaran untuk menghindari request tak terkendali. Jangan memasukkan mint atau pool yang tidak Anda audit.
 
+## Observasi pair DEX (tanpa transaksi)
+
+`pair-strategies.json` terpisah dari whitelist LST. Default memantau dua arah untuk `WSOL/USDC` dan `WSOL/USDT` di Meteora DLMM dan Raydium CLMM. Kedua leg dipaksa memakai venue yang **disjoint**; entry yang memasang label DEX sama di kedua sisi akan ditolak saat file dibaca.
+
+Untuk setiap nominal, observer mengambil quote ExactIn berikut secara serial:
+
+```text
+leg 1: WSOL → intermediate token pada DEX allowlist A
+leg 2: protected minimum output leg 1 → WSOL pada DEX allowlist B
+```
+
+Hanya `otherAmountThreshold` dari kedua quote yang dipakai. Output final protected dibandingkan dengan:
+
+```text
+flash principal + Kamino fee aktual + MAX_TX_COST_SOL + MIN_NET_PROFIT_SOL
+```
+
+Kelebihan output aktual leg pertama di atas minimum tidak dihitung sebagai profit; ini menjaga hasil observasi konservatif. `GATE PASS` pada output berarti hanya bahwa dua quote minimum saat itu menutup formula ekonomi. Itu **bukan** tanda siap eksekusi: pair observer belum memiliki code instruction, transaction, simulation, ataupun execution.
+
+Batas default adalah 64 request Jupiter per putaran (dua quote per candidate). Default saat ini memakai 32 request per `scan:pairs`; `watch:pairs` menunggu `PAIR_POLL_MS` (default 30 detik) setelah satu putaran selesai agar tidak membanjiri public API. Tambahkan pair/mint/DEX lain hanya setelah memverifikasi mint, token program, likuiditas, dan label DEX Jupiter. Token-2022 sengaja ditolak pada fase observer ini agar transfer-fee atau extension token tidak membuat hitungan quote tidak lengkap.
+
 ## Hot wallet tanpa Solana CLI
 
 Project dapat membuat keypair format Solana CLI dari Node.js lokal:
@@ -129,10 +171,15 @@ Command menolak overwrite file yang sudah ada dan hanya mencetak public address.
 npm run typecheck
 npm test
 
-# Tahap 1–2: tampilkan seluruh candidate whitelist; tidak sign/send
+# Tahap 1–2: tampilkan seluruh candidate whitelist LST; tidak sign/send
 npm run scan
 
-# Build candidate paling menguntungkan; tidak simulate/send
+# Phase 5a: observasi pair DEX. Hanya quote + state Kamino: tidak memuat keypair,
+# tidak meminta instruction, tidak build/simulate/sign/send.
+npm run scan:pairs
+npm run watch:pairs
+
+# Build candidate LST paling menguntungkan; tidak simulate/send
 npm run plan
 
 # Tahap 3: build + simulate top candidate; tidak send
@@ -162,6 +209,8 @@ Command membaca `RPC_URL` dan `KEYPAIR_PATH`, memeriksa saldo, lalu secara defau
 ## Batasan penting
 
 - Mainnet-only.
+- Pair observer sengaja tidak bisa di-upgrade menjadi execution melalui `.env`, `--yes`, atau command tersembunyi; tidak ada path instruction/transaction untuk pair strategy pada versi ini.
+- Pair observer membandingkan dua quote pada waktu berbeda. Perubahan slot, quote expiry, MEV, dan slippage berarti `GATE PASS` adalah sinyal riset, bukan peluang yang dapat langsung dieksekusi.
 - `WithdrawSol` memakai stake-pool reserve dan dapat gagal bila reserve tidak cukup, bahkan jika preview sebelumnya cukup; simulasi terbaru adalah validasi terakhir sebelum send.
 - SPL `WithdrawSol` versi standar pada SDK ini tidak membawa minimum-output parameter on-chain. Bot menggunakan quote minimum, estimasi konservatif, gate profit, dan full simulation; tetap ada risiko perubahan state antara simulation dan landing.
 - Quote profitable bukan jaminan transaction landing. Priority fee, account size, MEV, liquidity, dan state slot bisa berubah.

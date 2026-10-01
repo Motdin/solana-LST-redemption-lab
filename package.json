@@ -6,6 +6,8 @@
   "type": "module",
   "scripts": {
     "scan": "tsx src/cli.ts scan",
+    "scan:pairs": "tsx src/cli.ts scan:pairs",
+    "watch:pairs": "tsx src/cli.ts watch:pairs",
     "plan": "tsx src/cli.ts plan",
     "simulate": "tsx src/cli.ts simulate",
     "execute": "tsx src/cli.ts execute",

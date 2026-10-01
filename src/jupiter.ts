@@ -89,20 +89,39 @@ function asQuote(value: unknown): JupiterQuote {
   return quote as JupiterQuote;
 }
 
+export type JupiterQuoteOptions = {
+  /** Restrict a route to these exact Jupiter DEX labels. */
+  dexes?: readonly string[];
+  /** Exclude these exact Jupiter DEX labels. Mutually exclusive with dexes. */
+  excludeDexes?: readonly string[];
+  /** Override the global direct-route setting for this quote. */
+  onlyDirectRoutes?: boolean;
+};
+
 export async function getJupiterQuote(
   config: BotConfig,
   inputMint: PublicKey,
   outputMint: PublicKey,
   amountRaw: bigint,
+  options: JupiterQuoteOptions = {},
 ): Promise<JupiterQuote> {
+  if (options.dexes?.length && options.excludeDexes?.length) {
+    throw new Error("Jupiter quote cannot set both dexes and excludeDexes");
+  }
   const params = new URLSearchParams({
     inputMint: inputMint.toBase58(),
     outputMint: outputMint.toBase58(),
     amount: amountRaw.toString(),
     slippageBps: String(config.slippageBps),
-    onlyDirectRoutes: String(config.onlyDirectRoutes),
+    onlyDirectRoutes: String(
+      options.onlyDirectRoutes ?? config.onlyDirectRoutes,
+    ),
     restrictIntermediateTokens: "true",
   });
+  if (options.dexes?.length) params.set("dexes", options.dexes.join(","));
+  if (options.excludeDexes?.length) {
+    params.set("excludeDexes", options.excludeDexes.join(","));
+  }
   if (config.maxQuoteAccounts)
     params.set("maxAccounts", String(config.maxQuoteAccounts));
 

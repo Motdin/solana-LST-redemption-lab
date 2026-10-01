@@ -20,6 +20,8 @@ export type BotConfig = {
   kaminoLendingMarket: PublicKey;
   kaminoWsolReserve?: PublicKey;
   strategiesFile: string;
+  /** Observation-only DEX cycle whitelist. It has no execution command. */
+  pairStrategiesFile: string;
   jupiterApiBase: string;
   jupiterApiKey?: string;
   slippageBps: number;
@@ -33,6 +35,8 @@ export type BotConfig = {
   computeUnitLimit: number;
   computeUnitPriceMicroLamports: number;
   pollMs: number;
+  /** Slower default for a bounded but multi-quote public-API observer. */
+  pairPollMs: number;
   executionEnabled: boolean;
 };
 
@@ -98,24 +102,33 @@ function normalizeJupiterUrl(url: string): string {
 
 /**
  * Secrets remain in a local JSON keypair file; this parser only reads paths and
- * public configuration. Candidate amounts and pool whitelist live in STRATEGIES_FILE.
+ * public configuration. LST and observation-only pair whitelists live in JSON files.
  */
-export function loadConfig(): BotConfig {
+export function loadConfig(
+  options: { requireKeypair?: boolean } = {},
+): BotConfig {
   const network = optional("SOLANA_CLUSTER") ?? "mainnet-beta";
   if (network !== "mainnet-beta") {
     throw new Error(
-      "This scanner is pinned to mainnet-beta because its SPL stake-pool strategies are mainnet-only",
+      "This scanner is pinned to mainnet-beta because its configured strategies are mainnet-only",
     );
   }
 
   return {
     rpcUrl: required("RPC_URL"),
-    keypairPath: required("KEYPAIR_PATH"),
+    // Pair observation has no signing path and intentionally does not need a
+    // local keypair file. All other commands preserve the required keypair gate.
+    keypairPath:
+      options.requireKeypair === false
+        ? (optional("KEYPAIR_PATH") ?? "")
+        : required("KEYPAIR_PATH"),
     kaminoLendingMarket: asPublicKey("KAMINO_LENDING_MARKET"),
     kaminoWsolReserve: optional("KAMINO_WSOL_RESERVE")
       ? asPublicKey("KAMINO_WSOL_RESERVE")
       : undefined,
     strategiesFile: optional("STRATEGIES_FILE") ?? "./strategies.json",
+    pairStrategiesFile:
+      optional("PAIR_STRATEGIES_FILE") ?? "./pair-strategies.json",
     jupiterApiBase: normalizeJupiterUrl(
       optional("JUPITER_API_BASE") ?? "https://lite-api.jup.ag/swap/v1",
     ),
@@ -136,6 +149,7 @@ export function loadConfig(): BotConfig {
       10_000,
     ),
     pollMs: positiveInteger("POLL_MS", 5_000, 500),
+    pairPollMs: positiveInteger("PAIR_POLL_MS", 30_000, 5_000),
     executionEnabled: bool("EXECUTION_ENABLED", false),
   };
 }

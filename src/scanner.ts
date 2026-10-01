@@ -63,7 +63,7 @@ export function isEligibleCandidate(
   return candidate.status === "eligible";
 }
 
-function selectWsolReserve(
+export function selectWsolReserve(
   market: KaminoMarket,
   config: BotConfig,
 ): KaminoReserve {
