@@ -71,5 +71,11 @@ describe("pair strategy whitelist", () => {
         .filter((strategy) => strategy.id.includes("usdt"))
         .every((strategy) => !strategy.enabled),
     ).toBe(true);
+    expect(
+      enabled.flatMap((strategy) => [
+        ...strategy.legOneDexes,
+        ...strategy.legTwoDexes,
+      ]),
+    ).toContain("Whirlpool");
   });
 });

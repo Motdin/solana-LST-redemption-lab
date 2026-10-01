@@ -131,7 +131,7 @@ Scanner membatasi maksimal 24 strategi dan 64 quote per putaran untuk menghindar
 
 ## Observasi pair DEX (tanpa transaksi)
 
-`pair-strategies.json` terpisah dari whitelist LST. Default yang **aktif** memantau enam arah `WSOL/USDC` di Meteora DLMM, Raydium CLMM, dan Orca Whirlpool: setiap pasangan venue diamati pada kedua arah. Dua entry `WSOL/USDT` tetap tersedia tetapi dinonaktifkan karena observasi awal menunjukkan price impact yang jauh lebih buruk. Kedua leg dipaksa memakai venue yang **disjoint**; entry yang memasang label DEX sama di kedua sisi akan ditolak saat file dibaca.
+`pair-strategies.json` terpisah dari whitelist LST. Default yang **aktif** memantau enam arah `WSOL/USDC` di Meteora DLMM, Raydium CLMM, dan Whirlpool: setiap pasangan venue diamati pada kedua arah. Dua entry `WSOL/USDT` tetap tersedia tetapi dinonaktifkan karena observasi awal menunjukkan price impact yang jauh lebih buruk. Kedua leg dipaksa memakai venue yang **disjoint**; entry yang memasang label DEX sama di kedua sisi akan ditolak saat file dibaca.
 
 Untuk setiap nominal, observer mengambil quote ExactIn berikut secara serial:
 
