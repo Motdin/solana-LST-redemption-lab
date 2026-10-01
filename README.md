@@ -49,6 +49,16 @@ Lengkapi minimal berikut di `.env`:
 
 Alamat default mrgnFi LST dan stake pool boleh dibiarkan. Jangan menganggap nilai default amount masih profitable hari ini—nilai tersebut adalah flow yang diminta, sedangkan quote, fee, NAV, dan reserve dibaca ulang setiap run.
 
+### Membuat hot wallet tanpa Solana CLI
+
+Jika Solana CLI belum terpasang, Node.js dependency project sudah dapat membuat keypair standard tanpa mengirim secret ke jaringan:
+
+```bash
+npm run wallet:create
+```
+
+Secara default file dibuat di `~/.config/solana/flash-bot.json`; gunakan `npm run wallet:create -- --output <path>` untuk memilih lokasi lain. Command menolak overwrite file yang sudah ada dan hanya menampilkan public address. Masukkan path yang dicetak ke `KEYPAIR_PATH`, lalu transfer SOL kecil untuk gas. Jangan simpan keypair di folder repo atau membagikan isi file JSON-nya.
+
 ## Menjalankan
 
 ```bash

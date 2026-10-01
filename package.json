@@ -10,6 +10,7 @@
     "execute": "tsx src/cli.ts execute",
     "watch": "tsx src/cli.ts watch",
     "inspect:reserve": "tsx src/inspect-reserve.ts",
+    "wallet:create": "tsx src/create-wallet.ts",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "format:check": "prettier --check ."
