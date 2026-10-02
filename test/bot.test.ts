@@ -3,11 +3,13 @@ import { describe, expect, it, vi } from "vitest";
 import {
   auditFinalizedExecution,
   buildFlashRedeemPlan,
+  minimumWithdrawFloorRaw,
+  reconcileExecutionBalances,
   sendPlan,
   simulatePlan,
   type FlashRedeemPlan,
 } from "../src/bot.js";
-import type { EligibleCandidate } from "../src/scanner.js";
+import type { BuildableCandidate, EligibleCandidate } from "../src/scanner.js";
 
 const scanOnlyCandidate = {
   strategy: {
@@ -152,5 +154,91 @@ describe("flash redemption builder", () => {
       delta: { walletSolRaw: 1_000_000_000n },
     });
     expect(audit.logMessages).toEqual(["Program log: finalized"]);
+  });
+});
+
+describe("minimum withdraw floor", () => {
+  it("makes an economic candidate clear the whole gate on chain", () => {
+    expect(
+      minimumWithdrawFloorRaw({
+        status: "eligible",
+        economics: {
+          minimumWithdrawRaw: 1_005_100_000n,
+          flashRepaymentRaw: 1_000_100_000n,
+        },
+      } as unknown as EligibleCandidate),
+    ).toBe(1_005_100_000n);
+  });
+
+  it("gives a technical candidate the weaker principal-only floor", () => {
+    expect(
+      minimumWithdrawFloorRaw({
+        status: "technical",
+        economics: {
+          minimumWithdrawRaw: 1_005_100_000n,
+          flashRepaymentRaw: 1_000_100_000n,
+        },
+      } as unknown as BuildableCandidate),
+    ).toBe(1_000_100_000n);
+  });
+});
+
+describe("post-finality reconciliation", () => {
+  const lstAta = Keypair.generate().publicKey.toBase58();
+
+  function snapshot(walletSolRaw: bigint, wsolExists: boolean) {
+    return {
+      capturedAt: "2026-10-02T00:00:00.000Z",
+      wallet: Keypair.generate().publicKey.toBase58(),
+      walletSolRaw,
+      wsol: {
+        address: Keypair.generate().publicKey.toBase58(),
+        exists: wsolExists,
+        amountRaw: 0n,
+        accountLamportsRaw: 2_039_280n,
+      },
+      lst: {
+        address: lstAta,
+        exists: true,
+        amountRaw: 0n,
+        accountLamportsRaw: 2_039_280n,
+      },
+    };
+  }
+
+  it("recovers realized WithdrawSol proceeds from public balances", () => {
+    const executionPlan = plan();
+    const reconciliation = reconcileExecutionBalances({
+      plan: executionPlan,
+      before: snapshot(10_000_000_000n, false),
+      after: snapshot(10_017_855_720n, true),
+      transactionFeeRaw: 5_000n,
+    });
+
+    expect(reconciliation.realizedWithdrawRaw).toBe(1_020_000_000n);
+    expect(reconciliation.realizedNetRaw).toBe(17_855_720n);
+    expect(reconciliation.clearsMinimumWithdraw).toBe(true);
+    expect(reconciliation.shortfallRaw).toBe(0n);
+  });
+
+  it("flags a landed trade whose wallet SOL silently covered the shortfall", () => {
+    // WithdrawSol returned less than the flash repayment. The atomic flow still
+    // lands because the wallet tops the WSOL ATA up, so only the realized
+    // proceeds reveal the loss.
+    const executionPlan = plan();
+    // before + 1_000_000_000 withdrawn - 1_000_100_000 repaid - 5_000 fee
+    const reconciliation = reconcileExecutionBalances({
+      plan: executionPlan,
+      before: snapshot(10_000_000_000n, true),
+      after: snapshot(9_999_895_000n, true),
+      transactionFeeRaw: 5_000n,
+    });
+
+    expect(reconciliation.realizedWithdrawRaw).toBe(1_000_000_000n);
+    expect(reconciliation.realizedWithdrawRaw).toBeLessThan(
+      executionPlan.flashRepaymentRaw,
+    );
+    expect(reconciliation.clearsMinimumWithdraw).toBe(false);
+    expect(reconciliation.shortfallRaw).toBe(5_100_000n);
   });
 });

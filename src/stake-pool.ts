@@ -17,6 +17,23 @@ export type LoadedStakePool = {
   poolTokenDecimals: number;
 };
 
+/**
+ * Borsh variant index of `StakePoolInstruction::WithdrawSolWithSlippage` in the
+ * SPL Stake Pool program. Variants are appended in declaration order, and this
+ * variant was appended in February 2023 (solana-program/stake-pool #3980,
+ * "Add slippage to all deposit and withdraw ixs"), so it precedes nothing that
+ * predates it in the layout.
+ *
+ * The data payload is `borsh(u64 pool_tokens_in, u64 minimum_lamports_out)`.
+ * Because the repository always simulates the exact signed transaction before
+ * it can be broadcast, an unsupported index fails safely in simulation and
+ * never reaches the network; `STAKE_POOL_WITHDRAW_SLIPPAGE=false` falls back to
+ * the legacy instruction if the pinned program ever lacks it.
+ */
+export const WITHDRAW_SOL_WITH_SLIPPAGE_INDEX = 26;
+const WITHDRAW_SOL_WITH_SLIPPAGE_DATA_LENGTH = 17;
+const U64_MAX = (1n << 64n) - 1n;
+
 function bnToBigInt(value: BN): bigint {
   return BigInt(value.toString(10));
 }
@@ -74,6 +91,11 @@ export async function loadStakePool(
  * Conservative preview of WithdrawSol proceeds. The pool program applies the
  * pool-token exchange ratio then the configured SOL-withdrawal fee. Rounding the
  * fee upward ensures this preview never overstates the receive amount.
+ *
+ * When a pool has already scheduled a `nextSolWithdrawalFee`, the larger of the
+ * two is used. The scanner separately rejects a stale pool, which is the only
+ * situation in which the program promotes the pending fee, so this is pure
+ * defensiveness against a rule change rather than an expected path.
  */
 export function estimateWithdrawSolLamports(
   state: StakePool,
@@ -85,16 +107,52 @@ export function estimateWithdrawSolLamports(
     throw new Error("Stake-pool token supply is zero");
 
   const grossLamports = (poolTokens * totalLamports) / poolTokenSupply;
-  const numerator = bnToBigInt(state.solWithdrawalFee.numerator);
-  const denominator = bnToBigInt(state.solWithdrawalFee.denominator);
-  if (denominator === 0n || numerator === 0n) return grossLamports;
+  const fee = effectiveSolWithdrawalFee(state);
+  if (!fee) return grossLamports;
 
-  const fee = ceilDiv(grossLamports * numerator, denominator);
-  if (fee >= grossLamports)
+  const charged = ceilDiv(grossLamports * fee.numerator, fee.denominator);
+  if (charged >= grossLamports)
     throw new Error(
       "Stake-pool SOL withdrawal fee consumes the entire withdrawal",
     );
-  return grossLamports - fee;
+  return grossLamports - charged;
+}
+
+type WithdrawalFee = { numerator: bigint; denominator: bigint };
+
+/** The more expensive of the active and the scheduled SOL-withdrawal fee. */
+function effectiveSolWithdrawalFee(
+  state: StakePool,
+): WithdrawalFee | undefined {
+  const candidates: WithdrawalFee[] = [];
+  const current = asWithdrawalFee(state.solWithdrawalFee);
+  if (current) candidates.push(current);
+  const next = state.nextSolWithdrawalFee
+    ? asWithdrawalFee(state.nextSolWithdrawalFee)
+    : undefined;
+  if (next) candidates.push(next);
+
+  let highest: WithdrawalFee | undefined;
+  for (const candidate of candidates) {
+    if (
+      !highest ||
+      candidate.numerator * highest.denominator >
+        highest.numerator * candidate.denominator
+    ) {
+      highest = candidate;
+    }
+  }
+  return highest;
+}
+
+function asWithdrawalFee(value: {
+  numerator: BN;
+  denominator: BN;
+}): WithdrawalFee | undefined {
+  const numerator = bnToBigInt(value.numerator);
+  const denominator = bnToBigInt(value.denominator);
+  if (numerator === 0n || denominator === 0n) return undefined;
+  return { numerator, denominator };
 }
 
 export function buildUpdateStakePoolBalanceInstruction(
@@ -129,14 +187,21 @@ export function assertSolWithdrawPermission(
  * Burns the exact LST input and withdraws immediately-liquid SOL from the
  * reserve. This uses the wallet as the token authority, avoiding a temporary
  * approve delegate or an extra signer in the atomic transaction.
+ *
+ * When `withSlippage` is set, the program enforces `minimumLamportsOutRaw`
+ * on-chain. That floor is what stops a redemption shortfall from being papered
+ * over by the wallet's own SOL during the repayment step: without it, a small
+ * withdrawal simply gets topped up and the loss lands silently.
  */
 export function buildWithdrawSolInstruction(args: {
   pool: LoadedStakePool;
   wallet: PublicKey;
   sourceLstAccount: PublicKey;
   poolTokens: bigint;
+  withSlippage: boolean;
+  minimumLamportsOutRaw?: bigint;
 }): TransactionInstruction {
-  const { pool, wallet, sourceLstAccount, poolTokens } = args;
+  const { pool, wallet, sourceLstAccount, poolTokens, withSlippage } = args;
   assertSolWithdrawPermission(pool, wallet);
 
   if (poolTokens > BigInt(Number.MAX_SAFE_INTEGER)) {
@@ -145,7 +210,7 @@ export function buildWithdrawSolInstruction(args: {
     );
   }
 
-  return StakePoolInstruction.withdrawSol({
+  const classicInstruction = StakePoolInstruction.withdrawSol({
     stakePool: pool.address,
     withdrawAuthority: pool.withdrawAuthority,
     sourceTransferAuthority: wallet,
@@ -156,6 +221,31 @@ export function buildWithdrawSolInstruction(args: {
     poolMint: pool.state.poolMint,
     poolTokens: Number(poolTokens),
     solWithdrawAuthority: pool.state.solWithdrawAuthority,
+  });
+  if (!withSlippage) return classicInstruction;
+
+  const minimumLamportsOutRaw = args.minimumLamportsOutRaw;
+  if (minimumLamportsOutRaw === undefined || minimumLamportsOutRaw <= 0n) {
+    throw new Error(
+      "A protected WithdrawSol requires a positive minimum-lamports-out floor",
+    );
+  }
+  if (poolTokens > U64_MAX || minimumLamportsOutRaw > U64_MAX) {
+    throw new Error(
+      "WithdrawSol amounts must fit in an unsigned 64-bit integer",
+    );
+  }
+
+  // Account order is identical between the two variants; reuse the SDK's list
+  // so the layout can only diverge in the instruction data.
+  const data = Buffer.alloc(WITHDRAW_SOL_WITH_SLIPPAGE_DATA_LENGTH);
+  data.writeUInt8(WITHDRAW_SOL_WITH_SLIPPAGE_INDEX, 0);
+  data.writeBigUInt64LE(poolTokens, 1);
+  data.writeBigUInt64LE(minimumLamportsOutRaw, 9);
+  return new TransactionInstruction({
+    programId: classicInstruction.programId,
+    keys: classicInstruction.keys,
+    data,
   });
 }
 

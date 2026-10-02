@@ -5,7 +5,9 @@ import { describe, expect, it } from "vitest";
 import type { FinalizedExecutionAudit } from "../src/bot.js";
 import {
   appendExecutionAuditLog,
+  appendPartialExecutionAuditLog,
   executionAuditRecord,
+  partialExecutionAuditRecord,
 } from "../src/execution-audit-log.js";
 
 function audit(): FinalizedExecutionAudit {
@@ -66,6 +68,13 @@ function audit(): FinalizedExecutionAudit {
       lstTokenRaw: 2n,
       lstAccountLamportsRaw: 0n,
     },
+    reconciliation: {
+      realizedWithdrawRaw: 1_020_000_000n,
+      realizedNetRaw: 19_900_000n,
+      requiredWithdrawRaw: 1_015_100_000n,
+      clearsMinimumWithdraw: true,
+      shortfallRaw: 0n,
+    },
     auditedAt: "2026-10-02T00:01:00.000Z",
   };
 }
@@ -76,7 +85,36 @@ describe("execution audit log", () => {
 
     expect(record.transactionFeeRaw).toBe("5000");
     expect(record.delta.lstTokenRaw).toBe("2");
+    expect(record.partial).toBe(false);
+    expect(record.reconciliation).toMatchObject({
+      realizedWithdrawRaw: "1020000000",
+      clearsMinimumWithdraw: true,
+      shortfallRaw: "0",
+    });
     expect(JSON.stringify(record)).not.toContain("private");
+  });
+
+  it("records a partial receipt so a broadcast signature is never lost", () => {
+    const record = partialExecutionAuditRecord({
+      signature: "example-signature",
+      capturedAt: "2026-10-02T00:00:00.000Z",
+      error: "Finalized transaction receipt was not found",
+      plan: {
+        strategyId: "jitosol-redemption",
+        lstMint: "J1toso1uCk3RLmjorhTtrVwY9HJ7X8V9yYac6Y7kGCPn",
+        borrowRaw: 1_000_000_000n,
+        flashRepaymentRaw: 1_000_100_000n,
+        expectedWithdrawRaw: 1_020_000_000n,
+        targetMinimumWithdrawRaw: 1_005_100_000n,
+      },
+    });
+
+    expect(record).toMatchObject({
+      partial: true,
+      signature: "example-signature",
+      before: null,
+      plan: { targetMinimumWithdrawRaw: "1005100000" },
+    });
   });
 
   it("appends a finalized receipt as JSONL", async () => {
@@ -94,6 +132,40 @@ describe("execution audit log", () => {
       expect(record).toMatchObject({
         signature: "example-signature",
         succeeded: true,
+      });
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  });
+
+  it("appends a partial receipt to the same daily JSONL", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "ut-execution-audit-"));
+    try {
+      const { jsonlPath } = await appendPartialExecutionAuditLog({
+        directory,
+        audit: {
+          capturedAt: "2026-10-02T00:00:00.000Z",
+          error: "RPC read failed after broadcast",
+          plan: {
+            strategyId: "bsol-redemption",
+            lstMint: "bSo13r4TkiE4KumL71LsHTPpL2euBYLFx6h9HP3piy1",
+            borrowRaw: 500_000_000n,
+            flashRepaymentRaw: 500_050_000n,
+            expectedWithdrawRaw: 510_000_000n,
+            targetMinimumWithdrawRaw: 505_050_000n,
+          },
+        },
+      });
+      const record = JSON.parse(await readFile(jsonlPath, "utf8")) as {
+        partial: boolean;
+        signature: string | null;
+        error: string;
+      };
+
+      expect(record).toMatchObject({
+        partial: true,
+        signature: null,
+        error: "RPC read failed after broadcast",
       });
     } finally {
       await rm(directory, { force: true, recursive: true });

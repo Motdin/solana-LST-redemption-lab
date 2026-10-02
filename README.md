@@ -78,13 +78,15 @@ compute budget instructions
 → Jupiter setup instructions
 → Jupiter swap instructions
 → UpdateStakePoolBalance
-→ WithdrawSol
+→ WithdrawSol (with an on-chain minimum-lamports-out floor)
 → native SOL transfer for exact flash repayment
 → SyncNative
 → Kamino flash repay
 ```
 
-The standard `simulate` command runs an exact signed RPC simulation without broadcasting. The guarded `execute` command runs that simulation, broadcasts only after two explicit execution gates are present, waits for finality, and writes an audit receipt.
+`WithdrawSol` carries a protected floor by default (`STAKE_POOL_WITHDRAW_SLIPPAGE=true`). It uses the program's `WithdrawSolWithSlippage` variant, whose account list is identical to the legacy instruction, so a redemption that comes in under the floor reverts the whole atomic transaction instead of letting the repayment step quietly fund the difference from the wallet's own SOL. See [Wallet and atomicity risks](#wallet-and-atomicity-risks).
+
+The standard `simulate` command runs an exact signed RPC simulation without broadcasting. The guarded `execute` command runs that simulation, broadcasts only after two explicit execution gates are present, waits for finality, writes an audit receipt, and reconciles the realized redemption against the plan's gate.
 
 ### 3. DEX pair observer
 
@@ -228,13 +230,19 @@ The following controls reduce risk; they do not remove it.
 - The reserve must cover the estimated protected immediate redemption.
 - Jupiter quote input/output mints and exact input amount are verified.
 - The flash fee must remain within `MAX_FLASH_FEE_BPS`.
-- Jupiter instruction validation can reject unexpected signers and sensitive program IDs through `STRICT_JUPITER_VALIDATION=true`.
+- `WithdrawSol` carries an on-chain floor: the full repayment/cost/profit gate for an `ELIGIBLE` candidate, and the raw flash repayment for a `TECHNICAL ONLY` candidate that is only ever simulated.
+- Jupiter instruction validation rejects unexpected signers, this bot's own flow programs (System, ComputeBudget, Stake, SPL Stake Pool, Kamino), SPL Token / Token-2022 instructions outside `Transfer`, `TransferChecked`, and `SyncNative`, Associated Token Program instructions outside `Create` and `CreateIdempotent`, and any transfer that debits the declared swap-output account. The DEX programs themselves are not allowlisted, because Jupiter adds venues over time: this is a guardrail, not a proof of safety.
 
 ### Wallet and atomicity risks
 
 - A Solana transaction is atomic: if an instruction fails, its state changes revert. **The network fee can still be charged after a broadcast.**
 - Atomicity does not mean no economic risk. State, liquidity, the stake-pool exchange rate, and a Jupiter route can change between quote, simulation, and landing.
-- The current redemption flow receives redeemed SOL in the operator wallet, then transfers the exact repayment into the WSOL ATA. Keep the hot wallet balance small and dedicated. If the transaction design or state assumptions are wrong, pre-existing wallet SOL can be exposed to the repayment transfer.
+- The redemption flow receives redeemed SOL in the operator wallet, then transfers the exact repayment into the WSOL ATA. Without an on-chain floor this would make a shortfall _invisible_: the transfer would succeed using pre-existing wallet SOL, the transaction would land, and the loss would appear only as a smaller wallet balance. Three controls now face this:
+  1. `WithdrawSolWithSlippage` reverts the atomic transaction when the redemption misses the floor, so the wallet is never asked to cover a shortfall;
+  2. after finality the client recomputes the realized redemption from the before/after balances and the finalized fee, prints it, stores it in the audit record, and fails loudly (and stops `watch --execute`) if the realized proceeds miss the gate;
+  3. keep the hot wallet balance small and dedicated anyway, because controls 1 and 2 are code, not guarantees.
+- `STAKE_POOL_WITHDRAW_SLIPPAGE=false` restores the legacy instruction and gives up control 1. Only take that step after confirming on the target cluster that the program rejects the protected variant, and after accepting that a shortfall would then be covered by your own wallet balance.
+- Realized-proceeds reconciliation only proves what happened in one finalized transaction. It is not a profit guarantee, and it cannot see a loss that was deliberately paid outside the tracked accounts.
 - `simulate` is a point-in-time RPC execution preview, not a reservation of liquidity, block space, or price.
 - A transaction that simulates successfully can still expire, be dropped, be front-run, fail on changed state, or become unprofitable before landing.
 - A `finalized` receipt with `meta.err: null` proves that transaction execution succeeded. It does not independently value leftover LST, prove a strategy is repeatable, or make future transactions safe.
@@ -316,32 +324,37 @@ KEYPAIR_PATH=C:/Users/YourUser/.config/solana/flash-bot.json
 
 ### Configuration reference
 
-| Variable                           | Default                                     | Purpose                                                                                         |
-| ---------------------------------- | ------------------------------------------- | ----------------------------------------------------------------------------------------------- |
-| `RPC_URL`                          | required                                    | HTTPS RPC endpoint used for all mainnet reads, simulations, sends, and receipt queries.         |
-| `KEYPAIR_PATH`                     | required except quote-only pair observation | Local Solana CLI-format keypair JSON path. Never commit or share it.                            |
-| `SOLANA_CLUSTER`                   | `mainnet-beta`                              | Must remain `mainnet-beta`; other values are rejected.                                          |
-| `KAMINO_LENDING_MARKET`            | required                                    | Kamino market public key.                                                                       |
-| `KAMINO_WSOL_RESERVE`              | optional safety pin                         | Expected WSOL reserve in that market. Pin it after verifying with `inspect:reserve`.            |
-| `STRATEGIES_FILE`                  | `./strategies.json`                         | LST strategy whitelist.                                                                         |
-| `PAIR_STRATEGIES_FILE`             | `./pair-strategies.json`                    | Separate pair-observation whitelist.                                                            |
-| `JUPITER_API_BASE`                 | Jupiter Lite API                            | HTTPS Jupiter Swap API base URL. A dedicated endpoint/key is recommended for reliable research. |
-| `JUPITER_API_KEY`                  | unset                                       | Optional Jupiter API key.                                                                       |
-| `ONLY_DIRECT_ROUTES`               | `true`                                      | Restricts Jupiter quotes to direct routes.                                                      |
-| `MAX_QUOTE_ACCOUNTS`               | `40`                                        | Jupiter quote account cap.                                                                      |
-| `SLIPPAGE_BPS`                     | `25`                                        | Jupiter slippage setting. Review carefully; higher values increase execution risk.              |
-| `STRICT_JUPITER_VALIDATION`        | `true`                                      | Rejects suspicious Jupiter instruction content. Keep enabled unless independently audited.      |
-| `MAX_FLASH_FEE_BPS`                | `1`                                         | Maximum permitted Kamino flash fee relative to each borrow size.                                |
-| `MIN_NET_PROFIT_SOL`               | `0.01`                                      | Minimum expected profit after the configured transaction-cost budget.                           |
-| `MAX_TX_COST_SOL`                  | `0.005`                                     | Conservative transaction/rent/priority-fee budget included in the economic gate.                |
-| `MIN_GAS_BALANCE_SOL`              | `0.02`                                      | Minimum available wallet SOL required for plans and simulations. Simulation does not spend it.  |
-| `COMPUTE_UNIT_LIMIT`               | `1200000`                                   | Compute-unit limit instruction used in constructed plans.                                       |
-| `COMPUTE_UNIT_PRICE_MICROLAMPORTS` | `10000`                                     | Priority-fee price used in constructed plans. Include its risk in `MAX_TX_COST_SOL`.            |
-| `POLL_MS`                          | `5000`                                      | LST watcher interval.                                                                           |
-| `PAIR_POLL_MS`                     | `300000`                                    | Pair-observer interval.                                                                         |
-| `PAIR_OBSERVATION_LOG_DIR`         | `./logs/pair-observations`                  | Local JSONL and CSV pair-observation output directory.                                          |
-| `EXECUTION_AUDIT_LOG_DIR`          | `./logs/execution-audits`                   | Local finalized LST receipt and balance-reconciliation log directory.                           |
-| `EXECUTION_ENABLED`                | `false`                                     | First of two explicit gates required before an LST send.                                        |
+| Variable                           | Default                                     | Purpose                                                                                           |
+| ---------------------------------- | ------------------------------------------- | ------------------------------------------------------------------------------------------------- |
+| `RPC_URL`                          | required                                    | HTTPS RPC endpoint used for all mainnet reads, simulations, sends, and receipt queries.           |
+| `KEYPAIR_PATH`                     | required except quote-only pair observation | Local Solana CLI-format keypair JSON path. Never commit or share it.                              |
+| `SOLANA_CLUSTER`                   | `mainnet-beta`                              | Must remain `mainnet-beta`; other values are rejected.                                            |
+| `KAMINO_LENDING_MARKET`            | required                                    | Kamino market public key.                                                                         |
+| `KAMINO_WSOL_RESERVE`              | optional safety pin                         | Expected WSOL reserve in that market. Pin it after verifying with `inspect:reserve`.              |
+| `STRATEGIES_FILE`                  | `./strategies.json`                         | LST strategy whitelist.                                                                           |
+| `PAIR_STRATEGIES_FILE`             | `./pair-strategies.json`                    | Separate pair-observation whitelist.                                                              |
+| `JUPITER_API_BASE`                 | Jupiter Lite API                            | HTTPS Jupiter Swap API base URL. A dedicated endpoint/key is recommended for reliable research.   |
+| `JUPITER_API_KEY`                  | unset                                       | Optional Jupiter API key.                                                                         |
+| `JUPITER_TIMEOUT_MS`               | `8000`                                      | Per-request timeout (1000–60000ms); a hung call cannot stall a scan or watcher.                   |
+| `JUPITER_MAX_RETRIES`              | `2`                                         | Retries (0–5) for transport errors, HTTP 429, and HTTP 5xx, with exponential backoff + jitter.    |
+| `ONLY_DIRECT_ROUTES`               | `true`                                      | Restricts Jupiter quotes to direct routes.                                                        |
+| `MAX_QUOTE_ACCOUNTS`               | `40`                                        | Jupiter quote account cap.                                                                        |
+| `SLIPPAGE_BPS`                     | `25`                                        | Jupiter slippage setting; capped at 500 bps at load time. Higher values increase execution risk.  |
+| `STRICT_JUPITER_VALIDATION`        | `true`                                      | Rejects suspicious Jupiter instruction content. Keep enabled unless independently audited.        |
+| `STAKE_POOL_WITHDRAW_SLIPPAGE`     | `true`                                      | Adds an on-chain minimum-lamports-out floor to `WithdrawSol`. See the wallet-risk section.        |
+| `MAX_FLASH_FEE_BPS`                | `1`                                         | Maximum permitted Kamino flash fee relative to each borrow size.                                  |
+| `MIN_NET_PROFIT_SOL`               | `0.01`                                      | Minimum expected profit after the configured transaction-cost budget.                             |
+| `MAX_TX_COST_SOL`                  | `0.005`                                     | Conservative transaction/rent/priority-fee budget included in the economic gate.                  |
+| `MIN_GAS_BALANCE_SOL`              | `0.02`                                      | Minimum available wallet SOL required for plans and simulations. Simulation does not spend it.    |
+| `COMPUTE_UNIT_LIMIT`               | `1200000`                                   | Compute-unit limit instruction used in constructed plans.                                         |
+| `COMPUTE_UNIT_PRICE_MICROLAMPORTS` | `10000`                                     | Priority-fee price used in constructed plans; must be ≥ 1. Include its risk in `MAX_TX_COST_SOL`. |
+| `POLL_MS`                          | `5000`                                      | LST watcher interval.                                                                             |
+| `PAIR_POLL_MS`                     | `300000`                                    | Pair-observer interval.                                                                           |
+| `PAIR_OBSERVATION_LOG_DIR`         | `./logs/pair-observations`                  | Local JSONL and CSV pair-observation output directory.                                            |
+| `EXECUTION_AUDIT_LOG_DIR`          | `./logs/execution-audits`                   | Local finalized LST receipt and balance-reconciliation log directory.                             |
+| `EXECUTION_ENABLED`                | `false`                                     | First of two explicit gates required before an LST send.                                          |
+| `MIN_SEND_INTERVAL_MS`             | `10000`                                     | Minimum wall-clock gap between two broadcasts; tripping it stops `watch --execute`.               |
+| `MAX_SENDS_PER_SESSION`            | `5`                                         | Hard broadcast budget per process; reaching it stops `watch --execute`.                           |
 
 Inspect the configured reserve without loading a private key:
 
@@ -375,8 +388,8 @@ The supplied file includes three execution-mode SPL stake-pool strategies (`mrgn
 | Field              | Meaning                                                                               |
 | ------------------ | ------------------------------------------------------------------------------------- |
 | `id`               | Unique 1–48 character identifier using letters, digits, hyphens, or underscores.      |
-| `enabled`          | Whether the strategy is included in scans.                                            |
-| `mode`             | `execution` or `scan-only`. Omitted means `execution`.                                |
+| `enabled`          | Required boolean. A missing value is a parse error, never a silent "armed".           |
+| `mode`             | Required: `execution` or `scan-only`. A missing value is a parse error.               |
 | `lstMint`          | Expected pool-token mint.                                                             |
 | `stakePool`        | Expected stake-pool state account.                                                    |
 | `borrowAmountsSol` | Exact decimal strings, not JSON numbers. They are converted to integer WSOL lamports. |
@@ -518,6 +531,8 @@ It selects only an `execution` strategy that has passed:
 
 It may still fail the configured transaction-cost/profit margin. Such a candidate appears as `TECHNICAL ONLY` and is never selectable by `plan`, normal `simulate`, `execute`, or `watch --execute`.
 
+A technical candidate is still built with a protected `WithdrawSol` floor, but only one that covers the raw flash repayment. That keeps the no-send path useful for validating instruction order and accounts while refusing to paper over a principal shortfall. An `ELIGIBLE` candidate — the only kind that can be broadcast — carries the full repayment + cost + profit floor.
+
 The command then:
 
 1. obtains Jupiter swap instructions for the current quote;
@@ -541,8 +556,16 @@ After broadcast, the client:
 3. checks both confirmation error information and `meta.err`;
 4. records transaction fee, compute units, and program logs;
 5. reads SOL, WSOL ATA, and LST ATA balances before and after execution;
-6. calculates raw deltas; and
-7. writes a JSONL record in `EXECUTION_AUDIT_LOG_DIR`.
+6. calculates raw deltas;
+7. recovers the realized `WithdrawSol` proceeds from that equation
+   (`wallet delta + flash repayment + fee + rent of any ATA created in the
+transaction`) and fails loudly — and stops `watch --execute` — when they miss
+   the plan's gate; and
+8. writes a JSONL record in `EXECUTION_AUDIT_LOG_DIR`.
+
+If the audit reads themselves fail after a broadcast (RPC error, timeout, receipt not yet indexed), the client writes a **partial** record with the signature, the pre-send snapshot, and the failure reason, and then rethrows. A broadcast signature is never lost just because the follow-up reads failed. Both record kinds carry `schemaVersion: 1` and a `partial` flag.
+
+Every broadcast also passes a shared throttle: `MIN_SEND_INTERVAL_MS` between sends and `MAX_SENDS_PER_SESSION` per process. Tripping either limit raises an execution-integrity error that terminates the watcher instead of looping.
 
 Default path:
 
@@ -558,7 +581,8 @@ An audit record contains public information only:
 - program logs;
 - strategy and planned protected economics;
 - SOL, WSOL, and LST pre/post snapshots;
-- raw amount deltas.
+- raw amount deltas;
+- the realized-withdrawal reconciliation (`realizedWithdrawRaw`, `realizedNetRaw`, `requiredWithdrawRaw`, `clearsMinimumWithdraw`, `shortfallRaw`).
 
 It never stores a private key or serialized transaction bytes.
 
@@ -666,7 +690,10 @@ The tests validate local behavior and mocks. They do **not** prove live mainnet 
 - Mainnet-only configuration.
 - Public RPC and Jupiter endpoints can rate-limit, fail, return stale data, or differ from production infrastructure.
 - The scanner's estimate is conservative, but it is still an estimate based on a changing on-chain state.
-- Standard SPL `WithdrawSol` does not include a custom minimum-output argument in this implementation. The project relies on protected LST input, conservative estimates, economic gates, and simulation; state can still move before landing.
+- The protected `WithdrawSolWithSlippage` variant is part of the SPL Stake Pool program since February 2023, but this repository has not been run against a live cluster. Anyone enabling execution must confirm support there first: `npm run simulate` fails with an invalid-instruction-data error, and nothing is broadcast, if the variant is unavailable. `STAKE_POOL_WITHDRAW_SLIPPAGE=false` is the documented fallback.
+- The realized-proceeds reconciliation assumes no other process touches the hot wallet between the pre-send and post-finality snapshots, and it cannot value leftover LST residue.
+- Jupiter instruction validation is a guardrail, not a proof: the DEX programs invoked by a route are not allowlisted, because Jupiter adds venues over time.
+- The dependency tree (Kamino SDK and its transitive DeFi SDKs) is large and carries known advisories; see the dependency-audit notes in the repository analysis. A hot-wallet keypair lives in the same process.
 - Solana transaction fees may be charged for a broadcast transaction that ultimately fails.
 - Priority fees, address lookup tables, account creation, route availability, liquidity, blockhash validity, MEV, slot timing, and state transitions can all affect a real transaction.
 - A pair observer `GATE PASS` is research data, never an authorization to execute.

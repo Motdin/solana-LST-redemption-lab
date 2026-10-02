@@ -6,12 +6,9 @@ export const SOL_DECIMALS = 9;
 export const WSOL_MINT = new PublicKey(
   "So11111111111111111111111111111111111111112",
 );
-export const MARGINFI_LST_MINT = new PublicKey(
-  "LSTxxxnJzKDFSLr4dUkPcmCf5VyryEqzPLz5j4bpxFp",
-);
-export const MARGINFI_STAKE_POOL = new PublicKey(
-  "DqhH94PjkZsjAqEze2BEkWhFQJ6EyU6MdtMphMgnXqeK",
-);
+
+/** Hard ceiling for SLIPPAGE_BPS; an accidental order-of-magnitude typo must fail closed. */
+export const MAX_SLIPPAGE_BPS = 500;
 
 /** Global execution and pricing controls shared by every whitelisted strategy. */
 export type BotConfig = {
@@ -24,6 +21,9 @@ export type BotConfig = {
   pairStrategiesFile: string;
   jupiterApiBase: string;
   jupiterApiKey?: string;
+  /** Hard timeout and bounded retry budget for every Jupiter HTTP call. */
+  jupiterTimeoutMs: number;
+  jupiterMaxRetries: number;
   slippageBps: number;
   onlyDirectRoutes: boolean;
   maxQuoteAccounts?: number;
@@ -34,9 +34,18 @@ export type BotConfig = {
   minGasBalanceRaw: bigint;
   computeUnitLimit: number;
   computeUnitPriceMicroLamports: number;
+  /**
+   * When true, `WithdrawSol` carries an on-chain minimum-lamports-out floor, so
+   * a redemption shortfall reverts the whole atomic transaction instead of
+   * being silently covered from the wallet's own SOL balance.
+   */
+  stakePoolWithdrawSlippage: boolean;
   pollMs: number;
   /** Slower default for a bounded but multi-quote public-API observer. */
   pairPollMs: number;
+  /** Rate limit and hard stop for the armed execution paths. */
+  minSendIntervalMs: number;
+  maxSendsPerSession: number;
   /** Local-only destination for CSV and JSONL pair-observation records. */
   pairObservationLogDir: string;
   /** Local-only finalized LST execution receipts and balance reconciliations. */
@@ -88,6 +97,39 @@ function positiveInteger(name: string, fallback: number, min = 1): number {
   return nonNegativeInteger(name, fallback, min);
 }
 
+function boundedInteger(
+  name: string,
+  fallback: number,
+  min: number,
+  max: number,
+): number {
+  const value = nonNegativeInteger(name, fallback, min);
+  if (value > max) {
+    throw new Error(`${name} must be an integer between ${min} and ${max}`);
+  }
+  return value;
+}
+
+/** Loopback HTTP is tolerated for a local validator, never for a remote RPC. */
+function normalizeRpcUrl(value: string): string {
+  let parsed: URL;
+  try {
+    parsed = new URL(value);
+  } catch {
+    throw new Error(
+      "RPC_URL must be a valid URL, e.g. https://your-rpc.example.com",
+    );
+  }
+  if (parsed.protocol === "https:") return value;
+  const loopback = ["localhost", "127.0.0.1", "::1", "[::1]"].includes(
+    parsed.hostname,
+  );
+  if (parsed.protocol === "http:" && loopback) return value;
+  throw new Error(
+    "RPC_URL must use https://; plain http is only accepted for a loopback validator",
+  );
+}
+
 function amount(name: string, fallback: string): bigint {
   return toAtomic(optional(name) ?? fallback, SOL_DECIMALS);
 }
@@ -119,7 +161,7 @@ export function loadConfig(
   }
 
   return {
-    rpcUrl: required("RPC_URL"),
+    rpcUrl: normalizeRpcUrl(required("RPC_URL")),
     // Pair observation has no signing path and intentionally does not need a
     // local keypair file. All other commands preserve the required keypair gate.
     keypairPath:
@@ -137,7 +179,14 @@ export function loadConfig(
       optional("JUPITER_API_BASE") ?? "https://lite-api.jup.ag/swap/v1",
     ),
     jupiterApiKey: optional("JUPITER_API_KEY"),
-    slippageBps: positiveInteger("SLIPPAGE_BPS", 25, 1),
+    jupiterTimeoutMs: boundedInteger(
+      "JUPITER_TIMEOUT_MS",
+      8_000,
+      1_000,
+      60_000,
+    ),
+    jupiterMaxRetries: boundedInteger("JUPITER_MAX_RETRIES", 2, 0, 5),
+    slippageBps: boundedInteger("SLIPPAGE_BPS", 25, 1, MAX_SLIPPAGE_BPS),
     onlyDirectRoutes: bool("ONLY_DIRECT_ROUTES", true),
     maxQuoteAccounts: optional("MAX_QUOTE_ACCOUNTS")
       ? positiveInteger("MAX_QUOTE_ACCOUNTS", 40, 8)
@@ -148,12 +197,23 @@ export function loadConfig(
     maxTxCostRaw: amount("MAX_TX_COST_SOL", "0.005"),
     minGasBalanceRaw: amount("MIN_GAS_BALANCE_SOL", "0.02"),
     computeUnitLimit: positiveInteger("COMPUTE_UNIT_LIMIT", 1_200_000, 100_000),
-    computeUnitPriceMicroLamports: nonNegativeInteger(
+    // A zero price is almost certainly a misconfiguration for a transaction
+    // that must land atomically; require an explicit, non-zero priority fee.
+    computeUnitPriceMicroLamports: positiveInteger(
       "COMPUTE_UNIT_PRICE_MICROLAMPORTS",
       10_000,
+      1,
     ),
+    stakePoolWithdrawSlippage: bool("STAKE_POOL_WITHDRAW_SLIPPAGE", true),
     pollMs: positiveInteger("POLL_MS", 5_000, 500),
     pairPollMs: positiveInteger("PAIR_POLL_MS", 300_000, 30_000),
+    minSendIntervalMs: boundedInteger(
+      "MIN_SEND_INTERVAL_MS",
+      10_000,
+      1_000,
+      3_600_000,
+    ),
+    maxSendsPerSession: boundedInteger("MAX_SENDS_PER_SESSION", 5, 1, 1_000),
     pairObservationLogDir:
       optional("PAIR_OBSERVATION_LOG_DIR") ?? "./logs/pair-observations",
     executionAuditLogDir:

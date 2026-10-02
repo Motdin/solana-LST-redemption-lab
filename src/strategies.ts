@@ -43,16 +43,17 @@ function parseStrategy(value: unknown, index: number): FlashRedeemStrategy {
       `strategies[${index}].id must be 1-48 alphanumeric, hyphen, or underscore characters`,
     );
   }
-  if (value.enabled !== undefined && typeof value.enabled !== "boolean") {
-    throw new Error(`strategies[${index}].enabled must be boolean`);
-  }
-  if (
-    value.mode !== undefined &&
-    value.mode !== "execution" &&
-    value.mode !== "scan-only"
-  ) {
+  // Both fields are mandatory. An LST entry that forgets `mode` must never
+  // inherit execution rights, and one that forgets `enabled` must never be
+  // treated as armed; the whitelist is explicit by design.
+  if (typeof value.enabled !== "boolean") {
     throw new Error(
-      `strategies[${index}].mode must be "execution" or "scan-only"`,
+      `strategies[${index}].enabled is required and must be boolean`,
+    );
+  }
+  if (value.mode !== "execution" && value.mode !== "scan-only") {
+    throw new Error(
+      `strategies[${index}].mode is required and must be "execution" or "scan-only"`,
     );
   }
   if (
@@ -88,8 +89,8 @@ function parseStrategy(value: unknown, index: number): FlashRedeemStrategy {
 
   return {
     id,
-    enabled: value.enabled ?? true,
-    mode: (value.mode ?? "execution") as LstStrategyMode,
+    enabled: value.enabled,
+    mode: value.mode,
     lstMint: parsePublicKey(value.lstMint, `strategies[${index}].lstMint`),
     stakePool: parsePublicKey(
       value.stakePool,
