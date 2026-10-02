@@ -3,9 +3,13 @@ import type { BotConfig } from "../src/config.js";
 import {
   rankEligibleCandidates,
   rankExecutionEligibleCandidates,
+  rankTechnicalSimulationCandidates,
   requireBestCandidate,
+  requireBestTechnicalSimulationCandidate,
   type EligibleCandidate,
+  type ScanCandidate,
   type ScanResult,
+  type TechnicalCandidate,
 } from "../src/scanner.js";
 import type { LstStrategyMode } from "../src/strategies.js";
 
@@ -21,7 +25,20 @@ function candidate(
   } as unknown as EligibleCandidate;
 }
 
-function scan(candidates: EligibleCandidate[]): ScanResult {
+function technicalCandidate(
+  id: string,
+  mode: LstStrategyMode,
+  netAfterBudgetRaw: bigint,
+): TechnicalCandidate {
+  return {
+    status: "technical",
+    strategy: { id, mode },
+    economics: { expectedNetAfterBudgetRaw: netAfterBudgetRaw },
+    economicGateReason: "below economic gate",
+  } as unknown as TechnicalCandidate;
+}
+
+function scan(candidates: ScanCandidate[]): ScanResult {
   return {
     runtime: { walletBalanceRaw: 1_000_000_000n },
     candidates,
@@ -57,6 +74,24 @@ describe("LST scan-only selection", () => {
     const scanOnly = candidate("research-pool", "scan-only", 50n);
 
     expect(() => requireBestCandidate(scan([scanOnly]), config)).toThrow(
+      "No economically eligible execution-mode",
+    );
+  });
+
+  it("selects an execution technical candidate only for no-send simulation", () => {
+    const scanOnly = technicalCandidate("research-pool", "scan-only", 90n);
+    const technical = technicalCandidate("execution-pool", "execution", -5n);
+
+    expect(rankTechnicalSimulationCandidates([scanOnly, technical])).toEqual([
+      technical,
+    ]);
+    expect(
+      requireBestTechnicalSimulationCandidate(
+        scan([scanOnly, technical]),
+        config,
+      ),
+    ).toBe(technical);
+    expect(() => requireBestCandidate(scan([technical]), config)).toThrow(
       "No economically eligible execution-mode",
     );
   });

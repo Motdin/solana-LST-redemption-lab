@@ -39,6 +39,8 @@ export type BotConfig = {
   pairPollMs: number;
   /** Local-only destination for CSV and JSONL pair-observation records. */
   pairObservationLogDir: string;
+  /** Local-only finalized LST execution receipts and balance reconciliations. */
+  executionAuditLogDir: string;
   executionEnabled: boolean;
 };
 
@@ -154,6 +156,8 @@ export function loadConfig(
     pairPollMs: positiveInteger("PAIR_POLL_MS", 300_000, 30_000),
     pairObservationLogDir:
       optional("PAIR_OBSERVATION_LOG_DIR") ?? "./logs/pair-observations",
+    executionAuditLogDir:
+      optional("EXECUTION_AUDIT_LOG_DIR") ?? "./logs/execution-audits",
     executionEnabled: bool("EXECUTION_ENABLED", false),
   };
 }

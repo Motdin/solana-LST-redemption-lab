@@ -32,8 +32,8 @@ Kamino reference: WSOL flash principal + fee
 
 1. **Dynamic scanner, watch-only** — quote beberapa ukuran flash loan untuk mrgnFi LST dan menghitung output redemption terbaru.
 2. **Whitelist multi-pool** — tambahkan LST / SPL stake pool terverifikasi ke `strategies.json`.
-3. **Simulasi kandidat terbaik** — hanya kandidat `mode: "execution"` dengan `net >= MIN_NET_PROFIT_SOL` yang dibangun dan disimulasikan.
-4. **Execution bergated** — send hanya ketika kandidat terbaik LST `mode: "execution"` lulus scanner, build, simulation, `EXECUTION_ENABLED=true`, dan flag `--yes`.
+3. **Simulasi kandidat terbaik** — `simulate` hanya membangun dan mensimulasikan kandidat `mode: "execution"` dengan `net >= MIN_NET_PROFIT_SOL`. `simulate:technical` adalah jalur no-send terpisah untuk memeriksa kandidat struktural yang belum melewati gate ekonomi.
+4. **Execution bergated** — send hanya ketika kandidat terbaik LST `mode: "execution"` lulus scanner, exact signed simulation, `EXECUTION_ENABLED=true`, dan flag `--yes`; setelah itu bot menunggu finality lalu menyimpan receipt dan rekonsiliasi saldo lokal.
 5. **DEX pair observer** — scan read-only `WSOL → stablecoin → WSOL` pada dua venue Jupiter yang disjoint; candidate yang lulus gate dapat di-build/simulate lokal, tanpa command execution.
 
 Tidak ada `MIN_LST_OUT`, `LST_TO_BURN`, atau `MIN_WITHDRAW_SOL` statis. Scanner LST memakai **Jupiter `otherAmountThreshold`** sebagai jumlah LST yang dibakar, lalu menghitung kembali NAV/withdraw fee stake pool. Pair observer memakai threshold leg pertama sebagai input leg kedua dan hanya menilai threshold WSOL akhir. Keduanya memakai gate dinamis:
@@ -58,7 +58,8 @@ Dengan begitu nominal yang tidak lagi masuk akal di state terbaru—misalnya 1.1
 - Memakai `UpdateStakePoolBalance` sebelum `WithdrawSol` di transaksi atomik.
 - Sol hasil redeem diterima wallet, lalu hanya nominal repayment aktual yang di-wrap sebagai WSOL untuk Kamino; sisanya adalah kandidat profit.
 - Menolak Jupiter instruction dengan signer tambahan atau System/Stake/ComputeBudget/Kamino/Stake Pool program bila `STRICT_JUPITER_VALIDATION=true`.
-- `watch` default observe-only. Execution butuh dua gate eksplisit.
+- `simulate` LST memakai transaction bytes yang sudah ditandatangani, memverifikasi signature, dan tidak mengganti blockhash; ia tetap read-only RPC dan tidak memakai SOL wallet.
+- `watch` default observe-only. Execution butuh dua gate eksplisit dan setiap send menunggu status `finalized` sebelum audit receipt/balance dicatat.
 
 ## Install dan konfigurasi
 
@@ -89,9 +90,10 @@ Pair observer memakai file default `./pair-strategies.json`; ubah hanya jika And
 PAIR_STRATEGIES_FILE=./pair-strategies.json
 PAIR_POLL_MS=300000
 PAIR_OBSERVATION_LOG_DIR=./logs/pair-observations
+EXECUTION_AUDIT_LOG_DIR=./logs/execution-audits
 ```
 
-`scan:pairs` dan `watch:pairs` hanya membutuhkan `RPC_URL`, market/reserve Kamino, serta konfigurasi Jupiter. Keduanya tidak membaca `KEYPAIR_PATH`. `plan:pairs` dan `simulate:pairs` membutuhkan keypair untuk signature lokal dan tetap memeriksa `MIN_GAS_BALANCE_SOL`; keduanya tidak dapat mengirim transaksi. `KEYPAIR_PATH` juga tetap diperlukan untuk command LST `scan`, `plan`, `simulate`, `execute`, dan `watch`.
+`scan:pairs` dan `watch:pairs` hanya membutuhkan `RPC_URL`, market/reserve Kamino, serta konfigurasi Jupiter. Keduanya tidak membaca `KEYPAIR_PATH`. `plan:pairs` dan `simulate:pairs` membutuhkan keypair untuk signature lokal dan tetap memeriksa `MIN_GAS_BALANCE_SOL`; keduanya tidak dapat mengirim transaksi. `KEYPAIR_PATH` juga tetap diperlukan untuk command LST `scan`, `plan`, `simulate`, `simulate:technical`, `execute`, dan `watch`. `simulate:technical` tidak broadcast atau memakai SOL wallet, tetapi saldo minimum tetap diperiksa agar simulation dapat memodelkan ATA rent dan instruction yang sama persis seperti eksekusi.
 
 `KAMINO_WSOL_RESERVE` adalah optional safety pin. Untuk memverifikasi reserve dari market tanpa private key:
 
@@ -116,7 +118,7 @@ Contoh entry execution:
 }
 ```
 
-Untuk kandidat yang ingin tetap diukur tanpa pernah membangun transaksi, gunakan `"mode": "scan-only"`. Candidate scan-only mengikuti pipeline normal tanpa bypass: validasi mint pool dan owner program SPL stake-pool, izin `WithdrawSol` permissionless, freshness epoch, reserve, lalu—hanya setelah pemeriksaan on-chain itu lulus—quote Jupiter, fee, dan gate ekonomi. Bila lolos ekonomi, tabel CLI menampilkan status **`SCAN ONLY`**. Ia tetap tidak dapat dipilih oleh `plan`, `simulate`, `execute`, atau `watch --execute`; builder juga menolak langsung sebagai pertahanan berlapis.
+Untuk kandidat yang ingin tetap diukur tanpa pernah membangun transaksi, gunakan `"mode": "scan-only"`. Candidate scan-only mengikuti pipeline normal tanpa bypass: validasi mint pool dan owner program SPL stake-pool, izin `WithdrawSol` permissionless, freshness epoch, reserve, lalu—hanya setelah pemeriksaan on-chain itu lulus—quote Jupiter, fee, dan gate ekonomi. Bila lolos ekonomi, tabel CLI menampilkan status **`SCAN ONLY`**. Ia tetap tidak dapat dipilih oleh `plan`, `simulate`, `simulate:technical`, `execute`, atau `watch --execute`; builder juga menolak langsung sebagai pertahanan berlapis.
 
 `mode` hanya menerima `"execution"` atau `"scan-only"`. Entry lama yang tidak memiliki `mode` tetap kompatibel dan diperlakukan sebagai `"execution"`.
 
@@ -200,19 +202,26 @@ npm run simulate:pairs
 # Build candidate LST paling menguntungkan; tidak simulate/send
 npm run plan
 
-# Tahap 3: build + simulate top candidate; tidak send
+# Tahap 3: build + exact signed simulation top candidate yang lulus ekonomi; tidak send
 npm run simulate
+
+# Technical mode: kandidat execution yang lolos seluruh validasi struktural,
+# tetapi belum tentu profitabel. Exact simulation saja: tidak ada broadcast/SOL fee.
+npm run simulate:technical
 
 # Monitor berulang, observe-only
 npm run watch
 
-# Tahap 4: hanya setelah setup matang dan EXECUTION_ENABLED=true
+# Tahap 4: hanya setelah setup matang dan EXECUTION_ENABLED=true. Bot menunggu
+# finalized, memeriksa receipt on-chain, merekonsiliasi SOL/WSOL/LST, lalu log audit lokal.
 npm run execute -- --yes
 # atau monitor+execute top candidate yang lulus
 npm run watch -- --execute --yes
 ```
 
-`scan` dapat menampilkan banyak `rejected` candidate. Itu adalah hasil normal ketika redemption tidak menutup repayment atau quote tidak tersedia. Candidate `ELIGIBLE` baru berarti layak dibangun; masih harus lulus simulation sebelum send.
+`scan` dapat menampilkan banyak `rejected` candidate. Itu adalah hasil normal ketika redemption tidak menutup repayment atau quote tidak tersedia. Candidate `ELIGIBLE` baru berarti layak dibangun dan dipertimbangkan untuk send setelah simulation. Status `TECHNICAL ONLY` berarti semua validasi struktural, quote, fee, reserve, dan **raw flash repayment** lulus, tetapi output protected belum menutup budget biaya/profit gate; status tersebut hanya dapat dipakai oleh `simulate:technical`, tidak oleh jalur send.
+
+Setiap send LST yang mencapai finality menulis satu record JSONL ke `EXECUTION_AUDIT_LOG_DIR` (default `logs/execution-audits/`). Record menyimpan signature, slot, `meta.err`, network fee, compute units, program logs, snapshot saldo SOL/WSOL/LST sebelum dan sesudah, serta delta raw. Ia tidak menyimpan keypair atau bytes transaksi. Rekonsiliasi saldo mengasumsikan hot wallet tidak dipakai oleh transaksi lain sepanjang eksekusi.
 
 ## Mengirim profit SOL
 

@@ -29,7 +29,9 @@ describe("configuration signing boundary", () => {
         "d4A2prbA2whesmvHaL88BH6Ewn5N4bTSU2Ze8P6Bc4Q";
       delete process.env.KEYPAIR_PATH;
 
-      expect(loadConfig({ requireKeypair: false }).keypairPath).toBe("");
+      const config = loadConfig({ requireKeypair: false });
+      expect(config.keypairPath).toBe("");
+      expect(config.executionAuditLogDir).toBe("./logs/execution-audits");
       expect(() => loadConfig()).toThrow(
         "Missing required environment variable KEYPAIR_PATH",
       );

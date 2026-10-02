@@ -12,6 +12,7 @@
     "watch:pairs": "tsx src/cli.ts watch:pairs",
     "plan": "tsx src/cli.ts plan",
     "simulate": "tsx src/cli.ts simulate",
+    "simulate:technical": "tsx src/cli.ts simulate:technical",
     "execute": "tsx src/cli.ts execute",
     "watch": "tsx src/cli.ts watch",
     "inspect:reserve": "tsx src/inspect-reserve.ts",

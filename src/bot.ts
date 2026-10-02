@@ -9,6 +9,7 @@ import {
   TransactionInstruction,
   TransactionMessage,
   VersionedTransaction,
+  type Commitment,
 } from "@solana/web3.js";
 import {
   PROGRAM_ID,
@@ -26,13 +27,15 @@ import {
   buildUpdateStakePoolBalanceInstruction,
   buildWithdrawSolInstruction,
 } from "./stake-pool.js";
-import type { EligibleCandidate, ScannerRuntime } from "./scanner.js";
+import type { BuildableCandidate, ScannerRuntime } from "./scanner.js";
 
 export type FlashRedeemPlan = {
   transaction: VersionedTransaction;
   blockhash: string;
   lastValidBlockHeight: number;
   strategyId: string;
+  /** Only economic candidates may be submitted to the network. */
+  economicGatePassed: boolean;
   flashBorrowInstructionIndex: number;
   flashBorrowRaw: bigint;
   flashFeeRaw: bigint;
@@ -49,6 +52,59 @@ export type FlashRedeemPlan = {
   routeLabels: string[];
   reserve: string;
   stakePool: string;
+  wallet: string;
+  wsolAta: string;
+  lstAta: string;
+  lstMint: string;
+};
+
+export type TokenAccountBalanceSnapshot = {
+  address: string;
+  exists: boolean;
+  amountRaw: bigint;
+  accountLamportsRaw: bigint;
+};
+
+export type ExecutionBalanceSnapshot = {
+  capturedAt: string;
+  wallet: string;
+  walletSolRaw: bigint;
+  wsol: TokenAccountBalanceSnapshot;
+  lst: TokenAccountBalanceSnapshot;
+};
+
+export type FinalizedExecutionAudit = {
+  signature: string;
+  slot: number;
+  succeeded: boolean;
+  error?: string;
+  transactionFeeRaw: bigint;
+  computeUnitsConsumed?: number;
+  logMessages: string[];
+  plan: {
+    strategyId: string;
+    lstMint: string;
+    lstDecimals: number;
+    borrowRaw: bigint;
+    flashRepaymentRaw: bigint;
+    expectedWithdrawRaw: bigint;
+    expectedNetAfterBudgetRaw: bigint;
+  };
+  before: ExecutionBalanceSnapshot;
+  after: ExecutionBalanceSnapshot;
+  delta: {
+    walletSolRaw: bigint;
+    wsolTokenRaw: bigint;
+    wsolAccountLamportsRaw: bigint;
+    lstTokenRaw: bigint;
+    lstAccountLamportsRaw: bigint;
+  };
+  auditedAt: string;
+};
+
+export type FinalizedSubmission = {
+  signature: string;
+  confirmationError: unknown | null;
 };
 
 function assert(condition: unknown, message: string): asserts condition {
@@ -79,15 +135,17 @@ async function getLookupTables(
 }
 
 /**
- * Builds an execution-approved scanner candidate. The candidate burns Jupiter's
- * slippage-protected LST minimum, so its economic estimate is conservative.
+ * Builds an execution-mode candidate that passed structural validation. The
+ * candidate burns Jupiter's slippage-protected LST minimum, so its economic
+ * estimate is conservative. Only the caller's selection policy decides whether
+ * this is an economic execution plan or a no-send technical simulation.
  */
 export async function buildFlashRedeemPlan(args: {
   connection: Connection;
   wallet: Keypair;
   config: BotConfig;
   runtime: ScannerRuntime;
-  candidate: EligibleCandidate;
+  candidate: BuildableCandidate;
 }): Promise<FlashRedeemPlan> {
   const { connection, wallet, config, runtime, candidate } = args;
   const walletAddress = wallet.publicKey;
@@ -212,6 +270,7 @@ export async function buildFlashRedeemPlan(args: {
     blockhash: latestBlockhash.blockhash,
     lastValidBlockHeight: latestBlockhash.lastValidBlockHeight,
     strategyId: strategy.id,
+    economicGatePassed: candidate.status === "eligible",
     flashBorrowInstructionIndex,
     flashBorrowRaw: candidate.borrowRaw,
     flashFeeRaw: candidate.economics.flashFeeRaw,
@@ -229,16 +288,25 @@ export async function buildFlashRedeemPlan(args: {
     routeLabels: swap.routeLabels,
     reserve: runtime.reserve.address.toBase58(),
     stakePool: pool.address.toBase58(),
+    wallet: walletAddress.toBase58(),
+    wsolAta: wsolAta.toBase58(),
+    lstAta: lstAta.toBase58(),
+    lstMint: strategy.lstMint.toBase58(),
   };
 }
 
+/**
+ * Simulates the exact locally signed bytes. It does not replace the blockhash
+ * and verifies the signature, so a success is stronger than an RPC preflight
+ * that mutates either of those inputs. This is an RPC read-only operation.
+ */
 export async function simulatePlan(
   connection: Connection,
   plan: FlashRedeemPlan,
 ): Promise<{ unitsConsumed?: number; logs: string[] }> {
   const simulation = await connection.simulateTransaction(plan.transaction, {
-    sigVerify: false,
-    replaceRecentBlockhash: true,
+    sigVerify: true,
+    replaceRecentBlockhash: false,
     commitment: "processed",
   });
   if (simulation.value.err) {
@@ -253,10 +321,69 @@ export async function simulatePlan(
   };
 }
 
+async function snapshotTokenAccount(args: {
+  connection: Connection;
+  address: PublicKey;
+  commitment: Commitment;
+}): Promise<TokenAccountBalanceSnapshot> {
+  const { connection, address, commitment } = args;
+  const account = await connection.getAccountInfo(address, commitment);
+  if (!account) {
+    return {
+      address: address.toBase58(),
+      exists: false,
+      amountRaw: 0n,
+      accountLamportsRaw: 0n,
+    };
+  }
+  const balance = await connection.getTokenAccountBalance(address, commitment);
+  return {
+    address: address.toBase58(),
+    exists: true,
+    amountRaw: BigInt(balance.value.amount),
+    accountLamportsRaw: BigInt(account.lamports),
+  };
+}
+
+/**
+ * Captures the public balances relevant to the exact redemption plan. It only
+ * reads RPC state and is used both immediately before a send and after finality.
+ */
+export async function captureExecutionBalanceSnapshot(args: {
+  connection: Connection;
+  plan: FlashRedeemPlan;
+  commitment: Commitment;
+}): Promise<ExecutionBalanceSnapshot> {
+  const { connection, plan, commitment } = args;
+  const wallet = new PublicKey(plan.wallet);
+  const wsolAta = new PublicKey(plan.wsolAta);
+  const lstAta = new PublicKey(plan.lstAta);
+  const [walletSol, wsol, lst] = await Promise.all([
+    connection.getBalance(wallet, commitment),
+    snapshotTokenAccount({ connection, address: wsolAta, commitment }),
+    snapshotTokenAccount({ connection, address: lstAta, commitment }),
+  ]);
+  return {
+    capturedAt: new Date().toISOString(),
+    wallet: wallet.toBase58(),
+    walletSolRaw: BigInt(walletSol),
+    wsol,
+    lst,
+  };
+}
+
+/**
+ * Sends a previously exact-simulated plan then waits for finality. The caller
+ * must audit the returned signature before reporting the execution as success.
+ */
 export async function sendPlan(
   connection: Connection,
   plan: FlashRedeemPlan,
-): Promise<string> {
+): Promise<FinalizedSubmission> {
+  assert(
+    plan.economicGatePassed,
+    "Refusing to send a technical-simulation plan that does not clear the economic gate",
+  );
   const signature = await connection.sendRawTransaction(
     plan.transaction.serialize(),
     {
@@ -270,14 +397,79 @@ export async function sendPlan(
       blockhash: plan.blockhash,
       lastValidBlockHeight: plan.lastValidBlockHeight,
     },
-    "confirmed",
+    "finalized",
   );
-  if (confirmation.value.err) {
+  return { signature, confirmationError: confirmation.value.err };
+}
+
+/**
+ * Reads the finalized receipt plus the same public balances captured before the
+ * send. `succeeded` is only true when both the final confirmation and finalized
+ * transaction metadata report no error.
+ */
+export async function auditFinalizedExecution(args: {
+  connection: Connection;
+  plan: FlashRedeemPlan;
+  submission: FinalizedSubmission;
+  before: ExecutionBalanceSnapshot;
+}): Promise<FinalizedExecutionAudit> {
+  const { connection, plan, submission, before } = args;
+  let receipt = await connection.getTransaction(submission.signature, {
+    commitment: "finalized",
+    maxSupportedTransactionVersion: 0,
+  });
+  // A confirming RPC can expose finality just before its transaction-history
+  // index answers getTransaction. Retry the read without ever rebroadcasting.
+  for (let attempt = 0; !receipt?.meta && attempt < 3; attempt += 1) {
+    await new Promise<void>((resolve) => setTimeout(resolve, 250));
+    receipt = await connection.getTransaction(submission.signature, {
+      commitment: "finalized",
+      maxSupportedTransactionVersion: 0,
+    });
+  }
+  if (!receipt?.meta) {
     throw new Error(
-      `Transaction ${signature} confirmed with error: ${JSON.stringify(confirmation.value.err)}`,
+      `Finalized transaction receipt was not found for ${submission.signature}`,
     );
   }
-  return signature;
+  const after = await captureExecutionBalanceSnapshot({
+    connection,
+    plan,
+    commitment: "finalized",
+  });
+  const error = receipt.meta.err ?? submission.confirmationError;
+  const succeeded =
+    receipt.meta.err === null && submission.confirmationError === null;
+  return {
+    signature: submission.signature,
+    slot: receipt.slot,
+    succeeded,
+    error: succeeded ? undefined : JSON.stringify(error),
+    transactionFeeRaw: BigInt(receipt.meta.fee),
+    computeUnitsConsumed: receipt.meta.computeUnitsConsumed ?? undefined,
+    logMessages: receipt.meta.logMessages ?? [],
+    plan: {
+      strategyId: plan.strategyId,
+      lstMint: plan.lstMint,
+      lstDecimals: plan.lstDecimals,
+      borrowRaw: plan.flashBorrowRaw,
+      flashRepaymentRaw: plan.flashRepaymentRaw,
+      expectedWithdrawRaw: plan.expectedWithdrawRaw,
+      expectedNetAfterBudgetRaw: plan.expectedNetAfterBudgetRaw,
+    },
+    before,
+    after,
+    delta: {
+      walletSolRaw: after.walletSolRaw - before.walletSolRaw,
+      wsolTokenRaw: after.wsol.amountRaw - before.wsol.amountRaw,
+      wsolAccountLamportsRaw:
+        after.wsol.accountLamportsRaw - before.wsol.accountLamportsRaw,
+      lstTokenRaw: after.lst.amountRaw - before.lst.amountRaw,
+      lstAccountLamportsRaw:
+        after.lst.accountLamportsRaw - before.lst.accountLamportsRaw,
+    },
+    auditedAt: new Date().toISOString(),
+  };
 }
 
 export function planSummary(
@@ -285,6 +477,9 @@ export function planSummary(
 ): Record<string, string | number | string[]> {
   return {
     Strategy: plan.strategyId,
+    "Economic gate": plan.economicGatePassed
+      ? "PASS"
+      : "TECHNICAL SIMULATION ONLY",
     "Kamino WSOL reserve": plan.reserve,
     "LST stake pool": plan.stakePool,
     "Flash borrow": `${formatAtomic(plan.flashBorrowRaw, SOL_DECIMALS)} WSOL`,

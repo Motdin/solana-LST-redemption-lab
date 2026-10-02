@@ -35,8 +35,7 @@ export type RejectedCandidate = {
   poolTokenDecimals?: number;
 };
 
-export type EligibleCandidate = {
-  status: "eligible";
+type QuotedCandidate = {
   strategy: FlashRedeemStrategy;
   borrowRaw: bigint;
   pool: LoadedStakePool;
@@ -49,7 +48,22 @@ export type EligibleCandidate = {
   routeLabels: string[];
 };
 
-export type ScanCandidate = RejectedCandidate | EligibleCandidate;
+/** A candidate that passes every safety and economic gate. */
+export type EligibleCandidate = QuotedCandidate & {
+  status: "eligible";
+};
+
+/**
+ * A candidate safe to build and simulate but below the configured profitability
+ * threshold. It can never be selected by plan, normal simulate, or execution.
+ */
+export type TechnicalCandidate = QuotedCandidate & {
+  status: "technical";
+  economicGateReason: string;
+};
+
+export type BuildableCandidate = EligibleCandidate | TechnicalCandidate;
+export type ScanCandidate = RejectedCandidate | BuildableCandidate;
 
 export type ScanResult = {
   scannedAt: Date;
@@ -61,6 +75,12 @@ export function isEligibleCandidate(
   candidate: ScanCandidate,
 ): candidate is EligibleCandidate {
   return candidate.status === "eligible";
+}
+
+export function isBuildableCandidate(
+  candidate: ScanCandidate,
+): candidate is BuildableCandidate {
+  return candidate.status === "eligible" || candidate.status === "technical";
 }
 
 export function selectWsolReserve(
@@ -196,14 +216,14 @@ async function scanStrategy(args: {
           `Stake-pool reserve ${formatAtomic(pool.reserveLamports, SOL_DECIMALS)} cannot fund expected instant redemption`,
         );
       }
-      if (expectedWithdrawRaw < economics.minimumWithdrawRaw) {
+      // Technical simulation may bypass only the configured cost/profit margin,
+      // never the basic ability to repay the flash loan from protected proceeds.
+      if (expectedWithdrawRaw < economics.flashRepaymentRaw) {
         throw new Error(
-          `Expected WithdrawSol ${formatAtomic(expectedWithdrawRaw, SOL_DECIMALS)} is below dynamic repayment/profit gate ${formatAtomic(economics.minimumWithdrawRaw, SOL_DECIMALS)}`,
+          `Expected WithdrawSol ${formatAtomic(expectedWithdrawRaw, SOL_DECIMALS)} cannot cover flash repayment ${formatAtomic(economics.flashRepaymentRaw, SOL_DECIMALS)}`,
         );
       }
-
-      candidates.push({
-        status: "eligible",
+      const quotedCandidate: QuotedCandidate = {
         strategy,
         borrowRaw,
         pool,
@@ -214,7 +234,17 @@ async function scanStrategy(args: {
         expectedWithdrawRaw,
         economics,
         routeLabels: routeLabels(quote),
-      });
+      };
+      if (expectedWithdrawRaw < economics.minimumWithdrawRaw) {
+        candidates.push({
+          status: "technical",
+          ...quotedCandidate,
+          economicGateReason: `Expected WithdrawSol ${formatAtomic(expectedWithdrawRaw, SOL_DECIMALS)} is below dynamic repayment/profit gate ${formatAtomic(economics.minimumWithdrawRaw, SOL_DECIMALS)}`,
+        });
+        continue;
+      }
+
+      candidates.push({ status: "eligible", ...quotedCandidate });
     } catch (error) {
       candidates.push({
         status: "rejected",
@@ -298,19 +328,66 @@ export function rankExecutionEligibleCandidates(
   );
 }
 
+/**
+ * Execution-mode candidates that pass every structural safety check and can be
+ * assembled into an exact, no-send technical simulation. This intentionally
+ * includes candidates below the profitability gate.
+ */
+export function rankTechnicalSimulationCandidates(
+  candidates: ScanCandidate[],
+): BuildableCandidate[] {
+  return candidates
+    .filter(isBuildableCandidate)
+    .filter((candidate) => candidate.strategy.mode === "execution")
+    .sort((left, right) => {
+      if (
+        left.economics.expectedNetAfterBudgetRaw ===
+        right.economics.expectedNetAfterBudgetRaw
+      )
+        return 0;
+      return left.economics.expectedNetAfterBudgetRaw >
+        right.economics.expectedNetAfterBudgetRaw
+        ? -1
+        : 1;
+    });
+}
+
+function assertSimulationBalance(scan: ScanResult, config: BotConfig): void {
+  if (scan.runtime.walletBalanceRaw < config.minGasBalanceRaw) {
+    throw new Error(
+      `Wallet needs at least ${formatAtomic(config.minGasBalanceRaw, SOL_DECIMALS)} SOL available for ATA rent and transaction fees; simulation does not spend it`,
+    );
+  }
+}
+
 export function requireBestCandidate(
   scan: ScanResult,
   config: BotConfig,
 ): EligibleCandidate {
-  if (scan.runtime.walletBalanceRaw < config.minGasBalanceRaw) {
-    throw new Error(
-      `Wallet needs at least ${formatAtomic(config.minGasBalanceRaw, SOL_DECIMALS)} SOL for ATA rent and transaction fees`,
-    );
-  }
+  assertSimulationBalance(scan, config);
   const best = rankExecutionEligibleCandidates(scan.candidates)[0];
   if (!best) {
     throw new Error(
       "No economically eligible execution-mode flash-redemption candidate in this scan",
+    );
+  }
+  return best;
+}
+
+/**
+ * Selects an execution-mode candidate for `simulate:technical` only. The
+ * caller cannot use this selection for a send because send paths select via
+ * requireBestCandidate instead.
+ */
+export function requireBestTechnicalSimulationCandidate(
+  scan: ScanResult,
+  config: BotConfig,
+): BuildableCandidate {
+  assertSimulationBalance(scan, config);
+  const best = rankTechnicalSimulationCandidates(scan.candidates)[0];
+  if (!best) {
+    throw new Error(
+      "No structurally valid execution-mode flash-redemption candidate for technical simulation in this scan",
     );
   }
   return best;

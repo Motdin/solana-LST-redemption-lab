@@ -1,9 +1,12 @@
 import { Connection } from "@solana/web3.js";
 import {
+  auditFinalizedExecution,
   buildFlashRedeemPlan,
+  captureExecutionBalanceSnapshot,
   planSummary,
   sendPlan,
   simulatePlan,
+  type FinalizedExecutionAudit,
 } from "./bot.js";
 import { formatAtomic } from "./amount.js";
 import { loadConfig, SOL_DECIMALS } from "./config.js";
@@ -12,6 +15,7 @@ import {
   pairPlanSummary,
   simulateFlashPairPlan,
 } from "./pair-bot.js";
+import { appendExecutionAuditLog } from "./execution-audit-log.js";
 import { appendPairObservationLogs } from "./pair-observation-log.js";
 import {
   isPairObservation,
@@ -22,10 +26,12 @@ import {
 } from "./pair-scanner.js";
 import { loadPairStrategies } from "./pair-strategies.js";
 import {
+  isBuildableCandidate,
   isEligibleCandidate,
   rankEligibleCandidates,
   rankExecutionEligibleCandidates,
   requireBestCandidate,
+  requireBestTechnicalSimulationCandidate,
   scanFlashRedeemOpportunities,
   type ScanResult,
 } from "./scanner.js";
@@ -48,9 +54,10 @@ Commands:
   npm run watch:pairs             Re-scan pair observations at PAIR_POLL_MS; quotes only, never builds/signs/sends
   npm run plan:pairs              Build + locally sign a current gate-passing pair plan; never simulates/sends
   npm run simulate:pairs          Build + locally simulate a current gate-passing pair plan; never sends
-  npm run plan                    Build only the highest-ranked dynamic candidate; never sends
-  npm run simulate                Build + simulate the highest-ranked dynamic candidate; never sends
-  npm run execute -- --yes        Scan, simulate, then send the top candidate (requires EXECUTION_ENABLED=true)
+  npm run plan                    Build only the highest-ranked economic candidate; never sends
+  npm run simulate                Build + exact-simulate the highest-ranked economic candidate; never sends
+  npm run simulate:technical      Exact-simulate the best structurally valid execution candidate, even below the economic gate; never sends
+  npm run execute -- --yes        Scan, exact-simulate, send, finalize, and audit the top economic candidate (requires EXECUTION_ENABLED=true)
   npm run watch -- [--execute --yes]
                                   Re-scan at POLL_MS. Observe-only by default.
 
@@ -113,15 +120,20 @@ async function getPairBuildRuntime() {
 
 function printCandidateSummary(scan: ScanResult): void {
   const rows = scan.candidates.map((candidate) => {
-    const decimals = isEligibleCandidate(candidate)
+    const decimals = isBuildableCandidate(candidate)
       ? candidate.pool.poolTokenDecimals
       : (candidate.poolTokenDecimals ?? SOL_DECIMALS);
-    if (isEligibleCandidate(candidate)) {
+    if (isBuildableCandidate(candidate)) {
+      const status =
+        candidate.strategy.mode === "scan-only"
+          ? "SCAN ONLY"
+          : isEligibleCandidate(candidate)
+            ? "ELIGIBLE"
+            : "TECHNICAL ONLY";
       return {
         Strategy: candidate.strategy.id,
         Borrow: formatAtomic(candidate.borrowRaw, SOL_DECIMALS),
-        Status:
-          candidate.strategy.mode === "scan-only" ? "SCAN ONLY" : "ELIGIBLE",
+        Status: status,
         "Protected LST": formatAtomic(candidate.quoteMinimumOutRaw, decimals),
         "Expected SOL": formatAtomic(
           candidate.expectedWithdrawRaw,
@@ -132,7 +144,8 @@ function printCandidateSummary(scan: ScanResult): void {
           SOL_DECIMALS,
         ),
         Route: candidate.routeLabels.join(" → "),
-        Reason: "",
+        Reason:
+          candidate.status === "technical" ? candidate.economicGateReason : "",
       };
     }
     return {
@@ -163,7 +176,18 @@ function printCandidateSummary(scan: ScanResult): void {
   }
   if (scanOnlyRanked.length > 0) {
     console.log(
-      `Top scan-only candidate: ${scanOnlyRanked[0]?.strategy.id} / ${formatAtomic(scanOnlyRanked[0]?.borrowRaw ?? 0n, SOL_DECIMALS)} WSOL (never used by plan/simulate/execute).`,
+      `Top scan-only candidate: ${scanOnlyRanked[0]?.strategy.id} / ${formatAtomic(scanOnlyRanked[0]?.borrowRaw ?? 0n, SOL_DECIMALS)} WSOL (never used by plan/simulate/simulate:technical/execute).`,
+    );
+  }
+  const technicalExecution = scan.candidates.filter(
+    (candidate) =>
+      isBuildableCandidate(candidate) &&
+      candidate.status === "technical" &&
+      candidate.strategy.mode === "execution",
+  );
+  if (technicalExecution.length > 0) {
+    console.log(
+      `${technicalExecution.length} execution candidate(s) are structurally valid but below the economic gate; npm run simulate:technical can exact-simulate the best one and never sends.`,
     );
   }
   if (ranked.length === 0) {
@@ -252,6 +276,65 @@ async function printAndLogPairObservation(args: {
 
 function printPlanSummary(summary: ReturnType<typeof planSummary>): void {
   console.table(summary);
+}
+
+function printExecutionAuditSummary(audit: FinalizedExecutionAudit): void {
+  console.table({
+    Signature: audit.signature,
+    Finalized: audit.succeeded ? "yes" : "NO — transaction errored",
+    Slot: audit.slot,
+    "Transaction fee": `${formatAtomic(audit.transactionFeeRaw, SOL_DECIMALS)} SOL`,
+    "Compute units": audit.computeUnitsConsumed ?? "unknown",
+    "Wallet SOL delta": `${formatAtomic(audit.delta.walletSolRaw, SOL_DECIMALS)} SOL`,
+    "WSOL token delta": `${formatAtomic(audit.delta.wsolTokenRaw, SOL_DECIMALS)} WSOL`,
+    "WSOL ATA lamports delta": `${formatAtomic(audit.delta.wsolAccountLamportsRaw, SOL_DECIMALS)} SOL`,
+    "LST token delta": formatAtomic(
+      audit.delta.lstTokenRaw,
+      audit.plan.lstDecimals,
+    ),
+    "LST ATA lamports delta": `${formatAtomic(audit.delta.lstAccountLamportsRaw, SOL_DECIMALS)} SOL`,
+    "Expected net after budget": `${formatAtomic(audit.plan.expectedNetAfterBudgetRaw, SOL_DECIMALS)} SOL`,
+    "Before snapshot": audit.before.capturedAt,
+    "After snapshot": audit.after.capturedAt,
+    Error: audit.error ?? "",
+  });
+}
+
+async function sendAndAudit(args: {
+  runtime: Runtime;
+  plan: Awaited<ReturnType<typeof buildFlashRedeemPlan>>;
+}): Promise<FinalizedExecutionAudit> {
+  const { runtime, plan } = args;
+  const before = await captureExecutionBalanceSnapshot({
+    connection: runtime.connection,
+    plan,
+    commitment: "processed",
+  });
+  const submission = await sendPlan(runtime.connection, plan);
+  const audit = await auditFinalizedExecution({
+    connection: runtime.connection,
+    plan,
+    submission,
+    before,
+  });
+  printExecutionAuditSummary(audit);
+  try {
+    const { jsonlPath } = await appendExecutionAuditLog({
+      directory: runtime.config.executionAuditLogDir,
+      audit,
+    });
+    console.log(`Saved finalized execution audit: ${jsonlPath}`);
+  } catch (error) {
+    console.warn(
+      `Could not save finalized execution audit locally: ${(error as Error).message}`,
+    );
+  }
+  if (!audit.succeeded) {
+    throw new Error(
+      `Transaction ${audit.signature} finalized with error: ${audit.error ?? "unknown error"}`,
+    );
+  }
+  return audit;
 }
 
 function printPairPlanSummary(
@@ -345,14 +428,17 @@ async function watchPairObservations(): Promise<void> {
 }
 
 async function runOnce(
-  mode: "scan" | "plan" | "simulate" | "execute",
+  mode: "scan" | "plan" | "simulate" | "simulate:technical" | "execute",
 ): Promise<void> {
   const runtime = await getRuntime();
   console.log(`Searcher wallet: ${runtime.wallet.publicKey.toBase58()}`);
   const result = await scan(runtime);
   if (mode === "scan") return;
 
-  const candidate = requireBestCandidate(result, runtime.config);
+  const candidate =
+    mode === "simulate:technical"
+      ? requireBestTechnicalSimulationCandidate(result, runtime.config)
+      : requireBestCandidate(result, runtime.config);
   const plan = await buildFlashRedeemPlan({
     connection: runtime.connection,
     wallet: runtime.wallet,
@@ -365,13 +451,15 @@ async function runOnce(
 
   const simulation = await simulatePlan(runtime.connection, plan);
   console.log(
-    `Simulation succeeded${simulation.unitsConsumed ? `; ${simulation.unitsConsumed} compute units` : ""}.`,
+    `Exact signed simulation succeeded${simulation.unitsConsumed ? `; ${simulation.unitsConsumed} compute units` : ""}. No transaction was sent.`,
   );
-  if (mode === "simulate") return;
+  if (mode === "simulate" || mode === "simulate:technical") return;
 
   assertExecutionAllowed(runtime.config.executionEnabled);
-  const signature = await sendPlan(runtime.connection, plan);
-  console.log(`Sent atomic transaction: https://solscan.io/tx/${signature}`);
+  const audit = await sendAndAudit({ runtime, plan });
+  console.log(
+    `Finalized atomic transaction: https://solscan.io/tx/${audit.signature}`,
+  );
 }
 
 async function watch(): Promise<void> {
@@ -394,13 +482,13 @@ async function watch(): Promise<void> {
       });
       const simulation = await simulatePlan(runtime.connection, plan);
       console.log(
-        `Top candidate passed simulation${simulation.unitsConsumed ? ` (${simulation.unitsConsumed} CU)` : ""}.`,
+        `Top candidate passed exact signed simulation${simulation.unitsConsumed ? ` (${simulation.unitsConsumed} CU)` : ""}.`,
       );
       printPlanSummary(planSummary(plan));
       if (watchAndExecute) {
-        const signature = await sendPlan(runtime.connection, plan);
+        const audit = await sendAndAudit({ runtime, plan });
         console.log(
-          `Sent atomic transaction: https://solscan.io/tx/${signature}`,
+          `Finalized atomic transaction: https://solscan.io/tx/${audit.signature}`,
         );
       }
     } catch (error) {
@@ -436,6 +524,9 @@ async function main(): Promise<void> {
       return;
     case "simulate":
       await runOnce("simulate");
+      return;
+    case "simulate:technical":
+      await runOnce("simulate:technical");
       return;
     case "execute":
       await runOnce("execute");
