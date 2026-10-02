@@ -1,0 +1,9 @@
+node_modules/
+.env
+.env.*
+!.env.example
+*.log
+coverage/
+# Local market-observation JSONL/CSV records can grow quickly and are not source.
+logs/
+.DS_Store

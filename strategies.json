@@ -1,0 +1,60 @@
+{
+  "strategies": [
+    {
+      "id": "marginfi-lst-redemption",
+      "enabled": true,
+      "mode": "execution",
+      "lstMint": "LSTxxxnJzKDFSLr4dUkPcmCf5VyryEqzPLz5j4bpxFp",
+      "stakePool": "DqhH94PjkZsjAqEze2BEkWhFQJ6EyU6MdtMphMgnXqeK",
+      "borrowAmountsSol": ["0.25", "0.5", "1", "2.5", "5", "10"]
+    },
+    {
+      "id": "jitosol-redemption",
+      "enabled": true,
+      "mode": "execution",
+      "lstMint": "J1toso1uCk3RLmjorhTtrVwY9HJ7X8V9yYac6Y7kGCPn",
+      "stakePool": "Jito4APyf642JPZPx3hGc6WWJ8zPKtRbRs4P815Awbb",
+      "borrowAmountsSol": ["0.25", "0.5", "1", "2.5", "5", "10"]
+    },
+    {
+      "id": "bsol-redemption",
+      "enabled": true,
+      "mode": "execution",
+      "lstMint": "bSo13r4TkiE4KumL71LsHTPpL2euBYLFx6h9HP3piy1",
+      "stakePool": "stk9ApL5HeVAwPLr3TLhDXdZS8ptVu7zp6ov8HFDuMi",
+      "borrowAmountsSol": ["0.25", "0.5", "1", "2.5", "5", "10"]
+    },
+    {
+      "id": "compasssol-redemption-scan-only",
+      "enabled": true,
+      "mode": "scan-only",
+      "lstMint": "Comp4ssDzXcLeu2MnLuGNNFC4cmLPMng8qWHPvzAMU1h",
+      "stakePool": "AwDeTcW6BovNYR34Df1TPm4bFwswa4CJY4YPye2LXtPS",
+      "borrowAmountsSol": ["0.25", "0.5", "1", "2.5", "5", "10"]
+    },
+    {
+      "id": "hsol-redemption-scan-only",
+      "enabled": true,
+      "mode": "scan-only",
+      "lstMint": "he1iusmfkpAdwvxLNGV8Y1iSbj4rUy6yMhEA3fotn9A",
+      "stakePool": "3wK2g8ZdzAH8FJ7PKr2RcvGh7V9VYson5hrVsJM5Lmws",
+      "borrowAmountsSol": ["0.25", "0.5", "1", "2.5", "5", "10"]
+    },
+    {
+      "id": "pwrsol-redemption-scan-only",
+      "enabled": true,
+      "mode": "scan-only",
+      "lstMint": "pWrSoLAhue6jUxUkbWgmEy5rD9VJzkFmvfTDV5KgNuu",
+      "stakePool": "DfiQgSvpW3Dy4gKfhtdHnWGHwFUrE8exvaxqjtMtAVxk",
+      "borrowAmountsSol": ["0.25", "0.5", "1", "2.5", "5", "10"]
+    },
+    {
+      "id": "jsol-redemption-scan-only",
+      "enabled": true,
+      "mode": "scan-only",
+      "lstMint": "7Q2afV64in6N6SeZsAAB81TJzwDoD6zpqmHkzi9Dcavn",
+      "stakePool": "CtMyWsrUtAwXWiGr9WjHT5fC3p3fgV8cyGpLTo2LJzG1",
+      "borrowAmountsSol": ["0.25", "0.5", "1", "2.5", "5", "10"]
+    }
+  ]
+}
