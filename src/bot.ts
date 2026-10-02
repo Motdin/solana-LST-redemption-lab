@@ -29,6 +29,19 @@ import {
 } from "./stake-pool.js";
 import type { BuildableCandidate, ScannerRuntime } from "./scanner.js";
 
+/**
+ * On-chain floor passed to `WithdrawSolWithSlippage` for `candidate`.
+ *
+ * An economic candidate must clear the whole repayment + cost + profit gate on
+ * chain. A technical candidate is only ever simulated, so it is given the
+ * weaker floor that still protects the flash principal.
+ */
+export function minimumWithdrawFloorRaw(candidate: BuildableCandidate): bigint {
+  return candidate.status === "eligible"
+    ? candidate.economics.minimumWithdrawRaw
+    : candidate.economics.flashRepaymentRaw;
+}
+
 export type FlashRedeemPlan = {
   transaction: VersionedTransaction;
   blockhash: string;
@@ -45,6 +58,8 @@ export type FlashRedeemPlan = {
   lstToBurnRaw: bigint;
   lstDecimals: number;
   expectedWithdrawRaw: bigint;
+  /** On-chain `WithdrawSol` floor; undefined when the legacy instruction is used. */
+  withdrawMinimumLamportsOutRaw?: bigint;
   expectedNetBeforeNetworkRaw: bigint;
   expectedNetAfterBudgetRaw: bigint;
   targetMinimumWithdrawRaw: bigint;
@@ -73,6 +88,27 @@ export type ExecutionBalanceSnapshot = {
   lst: TokenAccountBalanceSnapshot;
 };
 
+/**
+ * Post-finality balance reconciliation. The lambda for a successful redemption
+ * is:
+ *
+ *   walletSolDelta = withdrawLamports - flashRepayment - txFee - newAtaRent
+ *
+ * so the realized `WithdrawSol` proceeds can be recovered exactly from the
+ * before/after snapshots and the finalized fee. Comparing it with the plan's
+ * dynamic gate is what catches a trade that landed but did not pay.
+ *
+ * It is only meaningful for a transaction that actually executed; a reverted
+ * transaction changed no balances, so callers must check `succeeded` first.
+ */
+export type ExecutionReconciliation = {
+  realizedWithdrawRaw: bigint;
+  realizedNetRaw: bigint;
+  requiredWithdrawRaw: bigint;
+  clearsMinimumWithdraw: boolean;
+  shortfallRaw: bigint;
+};
+
 export type FinalizedExecutionAudit = {
   signature: string;
   slot: number;
@@ -81,6 +117,7 @@ export type FinalizedExecutionAudit = {
   transactionFeeRaw: bigint;
   computeUnitsConsumed?: number;
   logMessages: string[];
+  reconciliation: ExecutionReconciliation;
   plan: {
     strategyId: string;
     lstMint: string;
@@ -236,6 +273,8 @@ export async function buildFlashRedeemPlan(args: {
       wallet: walletAddress,
       sourceLstAccount: lstAta,
       poolTokens: candidate.lstToBurnRaw,
+      withSlippage: config.stakePoolWithdrawSlippage,
+      minimumLamportsOutRaw: minimumWithdrawFloorRaw(candidate),
     }),
     SystemProgram.transfer({
       fromPubkey: walletAddress,
@@ -280,6 +319,9 @@ export async function buildFlashRedeemPlan(args: {
     lstToBurnRaw: candidate.lstToBurnRaw,
     lstDecimals: pool.poolTokenDecimals,
     expectedWithdrawRaw: candidate.expectedWithdrawRaw,
+    withdrawMinimumLamportsOutRaw: config.stakePoolWithdrawSlippage
+      ? minimumWithdrawFloorRaw(candidate)
+      : undefined,
     expectedNetBeforeNetworkRaw:
       candidate.economics.expectedNetBeforeNetworkRaw,
     expectedNetAfterBudgetRaw: candidate.economics.expectedNetAfterBudgetRaw,
@@ -311,9 +353,17 @@ export async function simulatePlan(
   });
   if (simulation.value.err) {
     const logs = simulation.value.logs ?? [];
-    throw new Error(
-      `Simulation failed: ${JSON.stringify(simulation.value.err)}\n${logs.join("\n")}`,
-    );
+    const detail = `${JSON.stringify(simulation.value.err)}\n${logs.join("\n")}`;
+    // A wrong instruction variant fails safely here, before any broadcast, so
+    // point the operator at the one setting that changes the variant.
+    const hint =
+      plan.withdrawMinimumLamportsOutRaw !== undefined &&
+      detail.includes("InvalidInstructionData")
+        ? "\nThe deployed SPL Stake Pool program rejected the protected WithdrawSol variant. " +
+          "Verify it on a cluster, then set STAKE_POOL_WITHDRAW_SLIPPAGE=false to fall back " +
+          "to the legacy instruction (which gives up the on-chain withdraw floor)."
+        : "";
+    throw new Error(`Simulation failed: ${detail}${hint}`);
   }
   return {
     unitsConsumed: simulation.value.unitsConsumed,
@@ -403,6 +453,45 @@ export async function sendPlan(
 }
 
 /**
+ * Recovers the realized `WithdrawSol` proceeds from public balances. Any ATA
+ * that did not exist before the send was created inside the transaction, so its
+ * rent-exempt lamports are part of the spend and are added back.
+ */
+export function reconcileExecutionBalances(args: {
+  plan: FlashRedeemPlan;
+  before: ExecutionBalanceSnapshot;
+  after: ExecutionBalanceSnapshot;
+  transactionFeeRaw: bigint;
+}): ExecutionReconciliation {
+  const { plan, before, after, transactionFeeRaw } = args;
+  const newAtaRentLamportsRaw =
+    (before.wsol.exists ? 0n : after.wsol.accountLamportsRaw) +
+    (before.lst.exists ? 0n : after.lst.accountLamportsRaw);
+  const realizedWithdrawRaw =
+    after.walletSolRaw -
+    before.walletSolRaw +
+    plan.flashRepaymentRaw +
+    transactionFeeRaw +
+    newAtaRentLamportsRaw;
+  const realizedNetRaw =
+    realizedWithdrawRaw -
+    plan.flashRepaymentRaw -
+    transactionFeeRaw -
+    newAtaRentLamportsRaw;
+  const requiredWithdrawRaw = plan.targetMinimumWithdrawRaw;
+  const clearsMinimumWithdraw = realizedWithdrawRaw >= requiredWithdrawRaw;
+  return {
+    realizedWithdrawRaw,
+    realizedNetRaw,
+    requiredWithdrawRaw,
+    clearsMinimumWithdraw,
+    shortfallRaw: clearsMinimumWithdraw
+      ? 0n
+      : requiredWithdrawRaw - realizedWithdrawRaw,
+  };
+}
+
+/**
  * Reads the finalized receipt plus the same public balances captured before the
  * send. `succeeded` is only true when both the final confirmation and finalized
  * transaction metadata report no error.
@@ -440,6 +529,12 @@ export async function auditFinalizedExecution(args: {
   const error = receipt.meta.err ?? submission.confirmationError;
   const succeeded =
     receipt.meta.err === null && submission.confirmationError === null;
+  const reconciliation = reconcileExecutionBalances({
+    plan,
+    before,
+    after,
+    transactionFeeRaw: BigInt(receipt.meta.fee),
+  });
   return {
     signature: submission.signature,
     slot: receipt.slot,
@@ -448,6 +543,7 @@ export async function auditFinalizedExecution(args: {
     transactionFeeRaw: BigInt(receipt.meta.fee),
     computeUnitsConsumed: receipt.meta.computeUnitsConsumed ?? undefined,
     logMessages: receipt.meta.logMessages ?? [],
+    reconciliation,
     plan: {
       strategyId: plan.strategyId,
       lstMint: plan.lstMint,
@@ -489,6 +585,10 @@ export function planSummary(
     "Jupiter protected output": `${formatAtomic(plan.quoteMinimumOutRaw, plan.lstDecimals)} LST`,
     "LST burned": `${formatAtomic(plan.lstToBurnRaw, plan.lstDecimals)} LST`,
     "WithdrawSol expected": `${formatAtomic(plan.expectedWithdrawRaw, SOL_DECIMALS)} SOL`,
+    "WithdrawSol on-chain floor":
+      plan.withdrawMinimumLamportsOutRaw === undefined
+        ? "none (legacy instruction)"
+        : `${formatAtomic(plan.withdrawMinimumLamportsOutRaw, SOL_DECIMALS)} SOL`,
     "Dynamic repayment/profit gate": `${formatAtomic(plan.targetMinimumWithdrawRaw, SOL_DECIMALS)} SOL`,
     "Expected net before network": `${formatAtomic(plan.expectedNetBeforeNetworkRaw, SOL_DECIMALS)} SOL`,
     "Expected net after fee budget": `${formatAtomic(plan.expectedNetAfterBudgetRaw, SOL_DECIMALS)} SOL`,

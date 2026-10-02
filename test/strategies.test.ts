@@ -15,10 +15,27 @@ describe("public strategy whitelist", () => {
     ],
   };
 
-  it("parses exact WSOL candidate amounts, defaults mode to execution, and deduplicates them", () => {
-    const [strategy] = parseStrategies(base);
+  it("parses exact WSOL candidate amounts and deduplicates them", () => {
+    const [strategy] = parseStrategies({
+      strategies: [{ ...base.strategies[0], mode: "execution" }],
+    });
     expect(strategy?.borrowAmountsRaw).toEqual([500_000_000n, 2_500_000_000n]);
     expect(strategy?.mode).toBe("execution");
+  });
+
+  it("requires an explicit mode instead of inheriting execution rights", () => {
+    expect(() => parseStrategies(base)).toThrow(
+      'strategies[0].mode is required and must be "execution" or "scan-only"',
+    );
+  });
+
+  it("requires an explicit enabled flag instead of defaulting to armed", () => {
+    const { enabled: _enabled, ...withoutEnabled } = base.strategies[0]!;
+    expect(() =>
+      parseStrategies({
+        strategies: [{ ...withoutEnabled, mode: "execution" }],
+      }),
+    ).toThrow("strategies[0].enabled is required and must be boolean");
   });
 
   it("accepts an explicit scan-only strategy mode", () => {
@@ -41,7 +58,7 @@ describe("public strategy whitelist", () => {
       mode: "observe",
     };
     expect(() => parseStrategies(malformed)).toThrow(
-      'mode must be "execution" or "scan-only"',
+      'strategies[0].mode is required and must be "execution" or "scan-only"',
     );
   });
 
@@ -51,6 +68,7 @@ describe("public strategy whitelist", () => {
     };
     malformed.strategies[0] = {
       ...malformed.strategies[0],
+      mode: "execution",
       borrowAmountsSol: [2.5],
     };
     expect(() => parseStrategies(malformed)).toThrow(

@@ -9,13 +9,16 @@ import {
   type FinalizedExecutionAudit,
 } from "./bot.js";
 import { formatAtomic } from "./amount.js";
-import { loadConfig, SOL_DECIMALS } from "./config.js";
+import { type BotConfig, loadConfig, SOL_DECIMALS } from "./config.js";
 import {
   buildFlashPairPlan,
   pairPlanSummary,
   simulateFlashPairPlan,
 } from "./pair-bot.js";
-import { appendExecutionAuditLog } from "./execution-audit-log.js";
+import {
+  appendExecutionAuditLog,
+  appendPartialExecutionAuditLog,
+} from "./execution-audit-log.js";
 import { appendPairObservationLogs } from "./pair-observation-log.js";
 import {
   isPairObservation,
@@ -60,6 +63,11 @@ Commands:
   npm run execute -- --yes        Scan, exact-simulate, send, finalize, and audit the top economic candidate (requires EXECUTION_ENABLED=true)
   npm run watch -- [--execute --yes]
                                   Re-scan at POLL_MS. Observe-only by default.
+
+Sent transactions carry an on-chain WithdrawSol floor (STAKE_POOL_WITHDRAW_SLIPPAGE),
+and every broadcast passes MIN_SEND_INTERVAL_MS and MAX_SENDS_PER_SESSION before it is
+sent. After finality the realized redemption is reconciled against the plan gate and a
+miss stops the watcher. Keep the hot wallet balance minimal regardless.
 
 LST redemption strategies are public whitelist entries in STRATEGIES_FILE.
 Pair observations are public entries in PAIR_STRATEGIES_FILE. Pair plans may only
@@ -294,10 +302,42 @@ function printExecutionAuditSummary(audit: FinalizedExecutionAudit): void {
     ),
     "LST ATA lamports delta": `${formatAtomic(audit.delta.lstAccountLamportsRaw, SOL_DECIMALS)} SOL`,
     "Expected net after budget": `${formatAtomic(audit.plan.expectedNetAfterBudgetRaw, SOL_DECIMALS)} SOL`,
+    "Realized WithdrawSol": `${formatAtomic(audit.reconciliation.realizedWithdrawRaw, SOL_DECIMALS)} SOL`,
+    "Realized net": `${formatAtomic(audit.reconciliation.realizedNetRaw, SOL_DECIMALS)} SOL`,
+    "Gate verified on-chain": audit.reconciliation.clearsMinimumWithdraw
+      ? "yes"
+      : `NO — short by ${formatAtomic(audit.reconciliation.shortfallRaw, SOL_DECIMALS)} SOL`,
     "Before snapshot": audit.before.capturedAt,
     "After snapshot": audit.after.capturedAt,
     Error: audit.error ?? "",
   });
+}
+
+/**
+ * Raised after a broadcast whose outcome is not a clean, gate-clearing trade.
+ * The watcher treats it as fatal instead of looping past it.
+ */
+export class ExecutionIntegrityError extends Error {}
+
+let lastSendAtMs = 0;
+let sendsThisSession = 0;
+
+/**
+ * The single choke point for every broadcast, so the rate limit and the
+ * per-session budget cannot be bypassed by a different command path.
+ */
+function assertExecutionThrottle(config: BotConfig): void {
+  if (sendsThisSession >= config.maxSendsPerSession) {
+    throw new ExecutionIntegrityError(
+      `Session send budget of ${config.maxSendsPerSession} reached; restart deliberately before sending again`,
+    );
+  }
+  const sinceLastSendMs = Date.now() - lastSendAtMs;
+  if (lastSendAtMs !== 0 && sinceLastSendMs < config.minSendIntervalMs) {
+    throw new ExecutionIntegrityError(
+      `Refusing to send again after ${sinceLastSendMs}ms; MIN_SEND_INTERVAL_MS is ${config.minSendIntervalMs}`,
+    );
+  }
 }
 
 async function sendAndAudit(args: {
@@ -305,18 +345,64 @@ async function sendAndAudit(args: {
   plan: Awaited<ReturnType<typeof buildFlashRedeemPlan>>;
 }): Promise<FinalizedExecutionAudit> {
   const { runtime, plan } = args;
+  assertExecutionThrottle(runtime.config);
   const before = await captureExecutionBalanceSnapshot({
     connection: runtime.connection,
     plan,
     commitment: "processed",
   });
-  const submission = await sendPlan(runtime.connection, plan);
-  const audit = await auditFinalizedExecution({
-    connection: runtime.connection,
-    plan,
-    submission,
-    before,
-  });
+
+  let signature: string | undefined;
+  let audit: FinalizedExecutionAudit;
+  try {
+    // The attempt consumes the budget before any network call: a broadcast
+    // whose confirmation read fails has still used a send.
+    lastSendAtMs = Date.now();
+    sendsThisSession += 1;
+    const submission = await sendPlan(runtime.connection, plan);
+    signature = submission.signature;
+    audit = await auditFinalizedExecution({
+      connection: runtime.connection,
+      plan,
+      submission,
+      before,
+    });
+  } catch (error) {
+    // The transaction may already be on chain. Persist whatever is known now
+    // instead of letting the signature disappear with the thrown error.
+    try {
+      const { jsonlPath } = await appendPartialExecutionAuditLog({
+        directory: runtime.config.executionAuditLogDir,
+        audit: {
+          signature,
+          capturedAt: new Date().toISOString(),
+          error: (error as Error).message,
+          plan: {
+            strategyId: plan.strategyId,
+            lstMint: plan.lstMint,
+            borrowRaw: plan.flashBorrowRaw,
+            flashRepaymentRaw: plan.flashRepaymentRaw,
+            expectedWithdrawRaw: plan.expectedWithdrawRaw,
+            targetMinimumWithdrawRaw: plan.targetMinimumWithdrawRaw,
+          },
+          before,
+        },
+      });
+      console.warn(
+        `Wrote a partial execution audit${signature ? ` for ${signature}` : ""}: ${jsonlPath}`,
+      );
+    } catch (writeError) {
+      console.warn(
+        `Could not write a partial execution audit: ${(writeError as Error).message}`,
+      );
+    }
+    // From here the watcher must stop: the transaction may be on chain and its
+    // outcome is unknown, which is never a "keep scanning" state.
+    throw new ExecutionIntegrityError(
+      `Send attempt for ${plan.strategyId} did not resolve cleanly: ${(error as Error).message}`,
+    );
+  }
+
   printExecutionAuditSummary(audit);
   try {
     const { jsonlPath } = await appendExecutionAuditLog({
@@ -330,8 +416,14 @@ async function sendAndAudit(args: {
     );
   }
   if (!audit.succeeded) {
-    throw new Error(
+    throw new ExecutionIntegrityError(
       `Transaction ${audit.signature} finalized with error: ${audit.error ?? "unknown error"}`,
+    );
+  }
+  if (!audit.reconciliation.clearsMinimumWithdraw) {
+    throw new ExecutionIntegrityError(
+      `Transaction ${audit.signature} landed but realized ${formatAtomic(audit.reconciliation.realizedWithdrawRaw, SOL_DECIMALS)} SOL of WithdrawSol proceeds, ` +
+        `short of the ${formatAtomic(audit.reconciliation.requiredWithdrawRaw, SOL_DECIMALS)} SOL gate by ${formatAtomic(audit.reconciliation.shortfallRaw, SOL_DECIMALS)} SOL`,
     );
   }
   return audit;
@@ -492,6 +584,9 @@ async function watch(): Promise<void> {
         );
       }
     } catch (error) {
+      // A landed-but-abnormal execution, a spent send budget, or a rate-limit
+      // trip must stop the watcher; only "no candidate" is a retryable state.
+      if (error instanceof ExecutionIntegrityError) throw error;
       console.log(
         `No executable candidate: ${(error as Error).message.split("\n")[0]}`,
       );

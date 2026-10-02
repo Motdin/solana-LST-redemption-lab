@@ -6,7 +6,12 @@ import {
   TransactionInstruction,
 } from "@solana/web3.js";
 import { STAKE_POOL_PROGRAM_ID } from "@solana/spl-stake-pool";
-import type { BotConfig } from "./config.js";
+import { type BotConfig } from "./config.js";
+import {
+  ASSOCIATED_TOKEN_PROGRAM_ID,
+  TOKEN_2022_PROGRAM_ID,
+  TOKEN_PROGRAM_ID,
+} from "./token.js";
 
 export type JupiterQuote = {
   inputMint: string;
@@ -58,6 +63,49 @@ function apiHeaders(config: BotConfig): Record<string, string> {
     "content-type": "application/json",
     ...(config.jupiterApiKey ? { "x-api-key": config.jupiterApiKey } : {}),
   };
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * The aggregator is an external HTTP dependency on the critical path of an
+ * atomic transaction, so every call is bounded by a timeout and a small,
+ * jittered retry budget for transport failures and rate limiting.
+ */
+async function fetchWithBudget(
+  config: BotConfig,
+  url: string,
+  init: RequestInit,
+): Promise<Response> {
+  const attempts = config.jupiterMaxRetries + 1;
+  let lastError = "unknown error";
+
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), config.jupiterTimeoutMs);
+    try {
+      const response = await fetch(url, { ...init, signal: controller.signal });
+      if (response.status !== 429 && response.status < 500) return response;
+      lastError = `HTTP ${response.status}`;
+    } catch (error) {
+      lastError =
+        (error as Error).name === "AbortError"
+          ? `request timed out after ${config.jupiterTimeoutMs}ms`
+          : (error as Error).message;
+    } finally {
+      clearTimeout(timer);
+    }
+    if (attempt + 1 < attempts) {
+      const backoff = Math.min(250 * 2 ** attempt, 2_000);
+      await sleep(backoff + Math.floor(Math.random() * 100));
+    }
+  }
+
+  throw new Error(
+    `Jupiter request to ${url} failed after ${attempts} attempt(s): ${lastError}`,
+  );
 }
 
 async function parseJson(response: Response): Promise<unknown> {
@@ -125,14 +173,10 @@ export async function getJupiterQuote(
   if (config.maxQuoteAccounts)
     params.set("maxAccounts", String(config.maxQuoteAccounts));
 
-  const response = await fetch(
-    `${config.jupiterApiBase}/quote?${params.toString()}`,
-    {
-      headers: config.jupiterApiKey
-        ? { "x-api-key": config.jupiterApiKey }
-        : {},
-    },
-  );
+  const url = `${config.jupiterApiBase}/quote?${params.toString()}`;
+  const response = await fetchWithBudget(config, url, {
+    headers: config.jupiterApiKey ? { "x-api-key": config.jupiterApiKey } : {},
+  });
   const json = await parseJson(response);
   if (!response.ok) {
     throw new Error(
@@ -162,16 +206,62 @@ function deserializeInstruction(
   }
 }
 
+const TOKEN_PROGRAM_IDS = new Set([
+  TOKEN_PROGRAM_ID.toBase58(),
+  TOKEN_2022_PROGRAM_ID.toBase58(),
+]);
+const ASSOCIATED_TOKEN_PROGRAM_ID_STRING =
+  ASSOCIATED_TOKEN_PROGRAM_ID.toBase58();
+
 /**
- * The aggregator is an external instruction source. At a minimum it must not be
- * able to ask a second signer, overwrite this transaction's compute budget, or
- * embed Kamino / stake-pool calls that change the declared flow.
+ * SPL Token instruction tags this bot expects to see from an aggregator. The
+ * design assumes an exact-input swap into an ATA this bot created itself, so
+ * account plumbing is limited to idempotent ATA creation plus the swap and its
+ * wrapped-SOL sync. Anything else (`Approve`, `CloseAccount`, `SetAuthority`,
+ * `Burn`, transfer-fee instructions, ...) is refused.
  */
-function validateJupiterInstructions(
+const ALLOWED_TOKEN_TAGS = new Map<number, string>([
+  [3, "Transfer"],
+  [12, "TransferChecked"],
+  [17, "SyncNative"],
+]);
+/** Associated Token Program: 0 = Create, 1 = CreateIdempotent. */
+const ALLOWED_ASSOCIATED_TOKEN_TAGS = new Map<number, string>([
+  [0, "Create"],
+  [1, "CreateIdempotent"],
+]);
+/** `Transfer` (tag 3) and `TransferChecked` (tag 12) always debit accounts[0]. */
+const TOKEN_TRANSFER_TAGS = new Set([3, 12]);
+
+export type JupiterValidationContext = {
+  wallet: PublicKey;
+  kaminoProgram: PublicKey;
+  /**
+   * The token account this bot declared as the swap output. A well-formed plan
+   * never spends it, so any transfer that debits it is a red flag.
+   */
+  outputTokenAccount: PublicKey;
+};
+
+/**
+ * The aggregator is an external instruction source. Program-level rules:
+ *
+ * - this bot's own flow programs (System, ComputeBudget, Stake, SPL Stake Pool,
+ *   Kamino) must never appear in an aggregator response, because a swapped-in
+ *   instruction could rebuild or replace the flash-loan flow;
+ * - anything calling the SPL Token / Token-2022 / ATA programs must be one of
+ *   the small, expected instruction shapes;
+ * - no instruction may require a second signer;
+ * - the declared swap-output account must never be a transfer source.
+ *
+ * The DEX programs themselves stay un-restricted because Jupiter adds venues
+ * over time; this is a guardrail, not a proof of safety.
+ */
+export function validateJupiterInstructions(
   instructions: TransactionInstruction[],
-  wallet: PublicKey,
-  kaminoProgram: PublicKey,
+  context: JupiterValidationContext,
 ): void {
+  const { wallet, kaminoProgram, outputTokenAccount } = context;
   const forbiddenPrograms = new Set([
     SystemProgram.programId.toBase58(),
     StakeProgram.programId.toBase58(),
@@ -181,11 +271,44 @@ function validateJupiterInstructions(
   ]);
 
   for (const instruction of instructions) {
-    if (forbiddenPrograms.has(instruction.programId.toBase58())) {
+    const programId = instruction.programId.toBase58();
+    if (forbiddenPrograms.has(programId)) {
       throw new Error(
-        `Strict Jupiter validation rejected unexpected program ${instruction.programId.toBase58()}`,
+        `Strict Jupiter validation rejected unexpected program ${programId}`,
       );
     }
+
+    if (TOKEN_PROGRAM_IDS.has(programId)) {
+      const tag = instruction.data[0];
+      const allowed =
+        tag === undefined ? undefined : ALLOWED_TOKEN_TAGS.get(tag);
+      if (!allowed) {
+        throw new Error(
+          `Strict Jupiter validation rejected SPL Token instruction tag ${tag ?? "(empty)"} on ${programId}; only Transfer, TransferChecked, and SyncNative are accepted`,
+        );
+      }
+      if (
+        tag !== undefined &&
+        TOKEN_TRANSFER_TAGS.has(tag) &&
+        instruction.keys[0]?.pubkey.equals(outputTokenAccount)
+      ) {
+        throw new Error(
+          `Strict Jupiter validation rejected a Jupiter transfer out of the declared output account ${outputTokenAccount.toBase58()}`,
+        );
+      }
+    }
+
+    if (programId === ASSOCIATED_TOKEN_PROGRAM_ID_STRING) {
+      const tag = instruction.data[0];
+      const allowed =
+        tag === undefined ? undefined : ALLOWED_ASSOCIATED_TOKEN_TAGS.get(tag);
+      if (!allowed) {
+        throw new Error(
+          `Strict Jupiter validation rejected Associated Token Program instruction tag ${tag ?? "(empty)"}; only Create and CreateIdempotent are accepted`,
+        );
+      }
+    }
+
     for (const account of instruction.keys) {
       if (account.isSigner && !account.pubkey.equals(wallet)) {
         throw new Error(
@@ -206,19 +329,23 @@ export async function getJupiterSwapPlan(args: {
 }): Promise<JupiterSwapPlan> {
   const { config, quote, wallet, destinationTokenAccount, kaminoProgram } =
     args;
-  const response = await fetch(`${config.jupiterApiBase}/swap-instructions`, {
-    method: "POST",
-    headers: apiHeaders(config),
-    body: JSON.stringify({
-      quoteResponse: quote,
-      userPublicKey: wallet.toBase58(),
-      destinationTokenAccount: destinationTokenAccount.toBase58(),
-      wrapAndUnwrapSol: false,
-      useSharedAccounts: false,
-      dynamicComputeUnitLimit: false,
-      // Compute-unit settings are deliberately supplied by this bot, not an API response.
-    }),
-  });
+  const response = await fetchWithBudget(
+    config,
+    `${config.jupiterApiBase}/swap-instructions`,
+    {
+      method: "POST",
+      headers: apiHeaders(config),
+      body: JSON.stringify({
+        quoteResponse: quote,
+        userPublicKey: wallet.toBase58(),
+        destinationTokenAccount: destinationTokenAccount.toBase58(),
+        wrapAndUnwrapSol: false,
+        useSharedAccounts: false,
+        dynamicComputeUnitLimit: false,
+        // Compute-unit settings are deliberately supplied by this bot, not an API response.
+      }),
+    },
+  );
   const json = (await parseJson(response)) as JupiterSwapInstructionsResponse;
   if (!response.ok || json.error) {
     throw new Error(
@@ -245,7 +372,11 @@ export async function getJupiterSwapPlan(args: {
   ];
   const allInstructions = [...setupInstructions, ...swapInstructions];
   if (config.strictJupiterValidation) {
-    validateJupiterInstructions(allInstructions, wallet, kaminoProgram);
+    validateJupiterInstructions(allInstructions, {
+      wallet,
+      kaminoProgram,
+      outputTokenAccount: destinationTokenAccount,
+    });
   }
 
   const lookupTableAddresses = (json.addressLookupTableAddresses ?? []).map(

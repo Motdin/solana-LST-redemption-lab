@@ -1,6 +1,7 @@
 import { PublicKey } from "@solana/web3.js";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import type { BotConfig } from "../src/config.js";
+import { pairPlanSummary, simulateFlashPairPlan } from "../src/pair-bot.js";
 import {
   requireBestPairCandidate,
   type PairObservation,
@@ -98,5 +99,50 @@ describe("pair plan eligibility", () => {
         walletBalanceRaw: 20_000_000n,
       }),
     ).toThrow("No economically eligible pair candidate");
+  });
+});
+
+describe("pair plan simulation surface", () => {
+  const planWith = (overrides: Record<string, unknown> = {}) =>
+    ({
+      transaction: { serialize: () => Buffer.from([1]) },
+      strategyId: "wsol-usdc-meteora-to-raydium",
+      flashBorrowRaw: 1_000_000_000n,
+      flashFeeRaw: 100_000n,
+      flashRepaymentRaw: 1_000_100_000n,
+      protectedIntermediateRaw: 99_000_000n,
+      intermediateDecimals: 6,
+      protectedFinalWsolRaw: 1_010_000_000n,
+      targetMinimumFinalWsolRaw: 1_005_100_000n,
+      expectedNetBeforeNetworkRaw: 9_900_000n,
+      expectedNetAfterBudgetRaw: 4_900_000n,
+      instructions: [],
+      firstRouteLabels: ["Meteora DLMM"],
+      secondRouteLabels: ["Raydium CLMM"],
+      reserve: "reserve",
+      ...overrides,
+    }) as unknown as Parameters<typeof simulateFlashPairPlan>[1];
+
+  it("surfaces program logs when a pair simulation fails", async () => {
+    const connection = {
+      simulateTransaction: vi.fn().mockResolvedValue({
+        value: {
+          err: { InstructionError: [4, "Custom"] },
+          logs: ["Program log: boom"],
+        },
+      }),
+    };
+
+    await expect(
+      simulateFlashPairPlan(connection as never, planWith()),
+    ).rejects.toThrow("Program log: boom");
+  });
+
+  it("prints the protected intermediate, final output, and floor", () => {
+    const summary = pairPlanSummary(planWith());
+
+    expect(summary["Protected final WSOL"]).toBe("1.01 WSOL");
+    expect(summary["Dynamic repayment/profit gate"]).toBe("1.0051 WSOL");
+    expect(summary["Jupiter leg one route"]).toEqual(["Meteora DLMM"]);
   });
 });
