@@ -289,6 +289,15 @@ export function rankEligibleCandidates(
   });
 }
 
+/** Economic candidates that are explicitly approved for LST plan/simulation/execution. */
+export function rankExecutionEligibleCandidates(
+  candidates: ScanCandidate[],
+): EligibleCandidate[] {
+  return rankEligibleCandidates(candidates).filter(
+    (candidate) => candidate.strategy.mode === "execution",
+  );
+}
+
 export function requireBestCandidate(
   scan: ScanResult,
   config: BotConfig,
@@ -298,10 +307,10 @@ export function requireBestCandidate(
       `Wallet needs at least ${formatAtomic(config.minGasBalanceRaw, SOL_DECIMALS)} SOL for ATA rent and transaction fees`,
     );
   }
-  const best = rankEligibleCandidates(scan.candidates)[0];
+  const best = rankExecutionEligibleCandidates(scan.candidates)[0];
   if (!best) {
     throw new Error(
-      "No economically eligible flash-redemption candidate in this scan",
+      "No economically eligible execution-mode flash-redemption candidate in this scan",
     );
   }
   return best;

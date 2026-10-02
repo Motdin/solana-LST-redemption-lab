@@ -24,6 +24,7 @@ import { loadPairStrategies } from "./pair-strategies.js";
 import {
   isEligibleCandidate,
   rankEligibleCandidates,
+  rankExecutionEligibleCandidates,
   requireBestCandidate,
   scanFlashRedeemOpportunities,
   type ScanResult,
@@ -119,7 +120,8 @@ function printCandidateSummary(scan: ScanResult): void {
       return {
         Strategy: candidate.strategy.id,
         Borrow: formatAtomic(candidate.borrowRaw, SOL_DECIMALS),
-        Status: "ELIGIBLE",
+        Status:
+          candidate.strategy.mode === "scan-only" ? "SCAN ONLY" : "ELIGIBLE",
         "Protected LST": formatAtomic(candidate.quoteMinimumOutRaw, decimals),
         "Expected SOL": formatAtomic(
           candidate.expectedWithdrawRaw,
@@ -150,11 +152,21 @@ function printCandidateSummary(scan: ScanResult): void {
   );
   console.table(rows);
   const ranked = rankEligibleCandidates(scan.candidates);
-  if (ranked.length > 0) {
+  const executionRanked = rankExecutionEligibleCandidates(scan.candidates);
+  const scanOnlyRanked = ranked.filter(
+    (candidate) => candidate.strategy.mode === "scan-only",
+  );
+  if (executionRanked.length > 0) {
     console.log(
-      `Top candidate: ${ranked[0]?.strategy.id} / ${formatAtomic(ranked[0]?.borrowRaw ?? 0n, SOL_DECIMALS)} WSOL`,
+      `Top execution candidate: ${executionRanked[0]?.strategy.id} / ${formatAtomic(executionRanked[0]?.borrowRaw ?? 0n, SOL_DECIMALS)} WSOL`,
     );
-  } else {
+  }
+  if (scanOnlyRanked.length > 0) {
+    console.log(
+      `Top scan-only candidate: ${scanOnlyRanked[0]?.strategy.id} / ${formatAtomic(scanOnlyRanked[0]?.borrowRaw ?? 0n, SOL_DECIMALS)} WSOL (never used by plan/simulate/execute).`,
+    );
+  }
+  if (ranked.length === 0) {
     console.log(
       "No candidate currently covers flash repayment, fee budget, and MIN_NET_PROFIT_SOL.",
     );

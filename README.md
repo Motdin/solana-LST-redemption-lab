@@ -13,7 +13,7 @@ Kamino flash borrow WSOL
 
 Project ini memiliki dua scanner terpisah:
 
-1. **LST redemption** — alur di atas untuk whitelist LST / SPL stake pool di `strategies.json`; dapat dibangun, disimulasikan, dan—hanya dengan gate eksplisit—dikirim.
+1. **LST redemption** — alur di atas untuk whitelist LST / SPL stake pool di `strategies.json`. Entry `mode: "execution"` dapat dibangun, disimulasikan, dan—hanya dengan gate eksplisit—dikirim; entry `mode: "scan-only"` tetap di-scan tetapi tidak pernah masuk jalur transaksi.
 2. **Pair observer** — observasi quote siklus dua venue untuk `WSOL → stablecoin → WSOL` dari `pair-strategies.json`:
 
 ```text
@@ -32,8 +32,8 @@ Kamino reference: WSOL flash principal + fee
 
 1. **Dynamic scanner, watch-only** — quote beberapa ukuran flash loan untuk mrgnFi LST dan menghitung output redemption terbaru.
 2. **Whitelist multi-pool** — tambahkan LST / SPL stake pool terverifikasi ke `strategies.json`.
-3. **Simulasi kandidat terbaik** — hanya kandidat dengan `net >= MIN_NET_PROFIT_SOL` yang dibangun dan disimulasikan.
-4. **Execution bergated** — send hanya ketika kandidat terbaik LST lulus scanner, build, simulation, `EXECUTION_ENABLED=true`, dan flag `--yes`.
+3. **Simulasi kandidat terbaik** — hanya kandidat `mode: "execution"` dengan `net >= MIN_NET_PROFIT_SOL` yang dibangun dan disimulasikan.
+4. **Execution bergated** — send hanya ketika kandidat terbaik LST `mode: "execution"` lulus scanner, build, simulation, `EXECUTION_ENABLED=true`, dan flag `--yes`.
 5. **DEX pair observer** — scan read-only `WSOL → stablecoin → WSOL` pada dua venue Jupiter yang disjoint; candidate yang lulus gate dapat di-build/simulate lokal, tanpa command execution.
 
 Tidak ada `MIN_LST_OUT`, `LST_TO_BURN`, atau `MIN_WITHDRAW_SOL` statis. Scanner LST memakai **Jupiter `otherAmountThreshold`** sebagai jumlah LST yang dibakar, lalu menghitung kembali NAV/withdraw fee stake pool. Pair observer memakai threshold leg pertama sebagai input leg kedua dan hanya menilai threshold WSOL akhir. Keduanya memakai gate dinamis:
@@ -101,23 +101,24 @@ npm run inspect:reserve
 
 ## Whitelist strategi
 
-`strategies.json` adalah file publik tanpa secret. Default memasukkan tiga pool SPL stake-pool yang akan tetap diverifikasi on-chain pada setiap scan: mrgnFi LST, JitoSOL, dan bSOL. Jika suatu pool memasang authority WithdrawSol atau reserve SOL-nya tidak cukup, scanner hanya menandainya `rejected` dan tidak akan membangun transaksi.
+`strategies.json` adalah file publik tanpa secret. Default memasukkan tiga pool SPL stake-pool execution (`mrgnFi LST`, `JitoSOL`, dan `bSOL`) serta empat kandidat riset scan-only (`compassSOL`, `hSOL`, `pwrSOL`, dan `JSOL`). Semua tetap diverifikasi on-chain pada setiap scan. Jika pemilik account pool bukan program SPL stake-pool, suatu pool memasang authority `WithdrawSol`, data epoch-nya stale, mint/pool tidak cocok, atau reserve SOL-nya tidak cukup, scanner hanya menandainya `rejected`.
 
-Contoh entry:
+Contoh entry execution:
 
 ```json
 {
-  "strategies": [
-    {
-      "id": "marginfi-lst-redemption",
-      "enabled": true,
-      "lstMint": "LSTxxxnJzKDFSLr4dUkPcmCf5VyryEqzPLz5j4bpxFp",
-      "stakePool": "DqhH94PjkZsjAqEze2BEkWhFQJ6EyU6MdtMphMgnXqeK",
-      "borrowAmountsSol": ["0.25", "0.5", "1", "2.5", "5", "10"]
-    }
-  ]
+  "id": "marginfi-lst-redemption",
+  "enabled": true,
+  "mode": "execution",
+  "lstMint": "LSTxxxnJzKDFSLr4dUkPcmCf5VyryEqzPLz5j4bpxFp",
+  "stakePool": "DqhH94PjkZsjAqEze2BEkWhFQJ6EyU6MdtMphMgnXqeK",
+  "borrowAmountsSol": ["0.25", "0.5", "1", "2.5", "5", "10"]
 }
 ```
+
+Untuk kandidat yang ingin tetap diukur tanpa pernah membangun transaksi, gunakan `"mode": "scan-only"`. Candidate scan-only mengikuti pipeline normal tanpa bypass: validasi mint pool dan owner program SPL stake-pool, izin `WithdrawSol` permissionless, freshness epoch, reserve, lalu—hanya setelah pemeriksaan on-chain itu lulus—quote Jupiter, fee, dan gate ekonomi. Bila lolos ekonomi, tabel CLI menampilkan status **`SCAN ONLY`**. Ia tetap tidak dapat dipilih oleh `plan`, `simulate`, `execute`, atau `watch --execute`; builder juga menolak langsung sebagai pertahanan berlapis.
+
+`mode` hanya menerima `"execution"` atau `"scan-only"`. Entry lama yang tidak memiliki `mode` tetap kompatibel dan diperlakukan sebagai `"execution"`.
 
 Untuk tahap 2, tambahkan object baru ke array `strategies`. Setiap entry harus mempunyai:
 
@@ -125,6 +126,7 @@ Untuk tahap 2, tambahkan object baru ke array `strategies`. Setiap entry harus m
 - `lstMint` yang benar;
 - `stakePool` SPL Stake Pool yang benar;
 - `borrowAmountsSol` sebagai string decimal;
+- `mode: "scan-only"` untuk kandidat riset atau `mode: "execution"` hanya setelah alur transaksi diaudit;
 - `enabled: true` hanya setelah pool/mint diverifikasi.
 
 Scanner membatasi maksimal 24 strategi dan 64 quote per putaran untuk menghindari request tak terkendali. Jangan memasukkan mint atau pool yang tidak Anda audit.

@@ -79,7 +79,7 @@ async function getLookupTables(
 }
 
 /**
- * Builds the exact top-ranked scanner candidate. The candidate burns Jupiter's
+ * Builds an execution-approved scanner candidate. The candidate burns Jupiter's
  * slippage-protected LST minimum, so its economic estimate is conservative.
  */
 export async function buildFlashRedeemPlan(args: {
@@ -93,6 +93,10 @@ export async function buildFlashRedeemPlan(args: {
   const walletAddress = wallet.publicKey;
   const { pool, strategy } = candidate;
 
+  assert(
+    strategy.mode === "execution",
+    `Refusing to build scan-only LST strategy ${strategy.id}`,
+  );
   assert(
     candidate.quote.inputMint === WSOL_MINT.toBase58() &&
       candidate.quote.outputMint === strategy.lstMint.toBase58(),

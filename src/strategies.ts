@@ -8,9 +8,13 @@ const MAX_STRATEGIES = 24;
 const MAX_AMOUNTS_PER_STRATEGY = 16;
 const MAX_TOTAL_QUOTES = 64;
 
+export type LstStrategyMode = "execution" | "scan-only";
+
 export type FlashRedeemStrategy = {
   id: string;
   enabled: boolean;
+  /** scan-only strategies are never eligible for plan/simulate/execute. */
+  mode: LstStrategyMode;
   lstMint: PublicKey;
   stakePool: PublicKey;
   borrowAmountsRaw: bigint[];
@@ -41,6 +45,15 @@ function parseStrategy(value: unknown, index: number): FlashRedeemStrategy {
   }
   if (value.enabled !== undefined && typeof value.enabled !== "boolean") {
     throw new Error(`strategies[${index}].enabled must be boolean`);
+  }
+  if (
+    value.mode !== undefined &&
+    value.mode !== "execution" &&
+    value.mode !== "scan-only"
+  ) {
+    throw new Error(
+      `strategies[${index}].mode must be "execution" or "scan-only"`,
+    );
   }
   if (
     !Array.isArray(value.borrowAmountsSol) ||
@@ -76,6 +89,7 @@ function parseStrategy(value: unknown, index: number): FlashRedeemStrategy {
   return {
     id,
     enabled: value.enabled ?? true,
+    mode: (value.mode ?? "execution") as LstStrategyMode,
     lstMint: parsePublicKey(value.lstMint, `strategies[${index}].lstMint`),
     stakePool: parsePublicKey(
       value.stakePool,
